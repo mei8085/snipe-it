@@ -39,8 +39,12 @@ AssetImporter / UserImporter / AccessoryImporter / ... (具体类型导入器)
 ```php
 // 1. MIME 类型校验
 if (! in_array($file->getMimeType(), [
-    'application/vnd.ms-excel', 'text/csv', 'application/csv', 
-    'text/plain', 'text/comma-separated-values', 'text/tsv'
+    'application/vnd.ms-excel',
+    'text/csv',
+    'application/csv',
+    'text/plain',
+    'text/comma-separated-values',
+    'text/tsv',
 ])) {
     return response()->json(['error' => 'File type must be CSV...'], 422);
 }
@@ -49,7 +53,6 @@ if (! in_array($file->getMimeType(), [
 $encoding = $detector->getEncoding($file_contents);
 if (strcasecmp($encoding, 'UTF-8') != 0) {
     $transliterated = iconv(strtoupper($encoding), 'UTF-8', $file_contents);
-    // 转换失败则终止导入
 }
 
 // 3. 重复表头检测
@@ -66,7 +69,7 @@ for ($i = 0; $i < count($import->header_row); $i++) {
 
 ### 2.3 第二层：字段映射校验 (`ItemImportRequest.php:33-71`)
 
-**真实行为澄清：仅做空值检查，无字段类型匹配！**
+**真实行为：仅做空值检查，无字段类型匹配！**
 
 ```php
 if ($import->field_map) {
@@ -77,17 +80,16 @@ if ($import->field_map) {
             $errorMessage = trans('validation.import_field_empty', ['fieldname' => $field]);
             $this->errorCallback($import, $field, [$field => [$errorMessage]]);
 
-            return $this->errors;  // 任意字段映射为空立即终止
+            return $this->errors;
         }
     }
-    // 字段键值反转，准备传入导入器
     $fieldMappings = array_change_key_case(array_flip($import->field_map), CASE_LOWER);
 }
 ```
 
 **关键说明：**
 - 校验逻辑：遍历字段映射数组，检查是否有 `is_null($fieldValue)`
-- 一旦发现任意一个 CSV 列被映射为 `null`（即用户选择了"Do Not Import"），立即终止整个导入流程
+- 一旦发现任意一个 CSV 列被映射为 `null`，立即终止整个导入流程
 - **没有任何字段类型匹配的校验逻辑**，类型校验完全推迟到第三层行级处理时进行
 
 ### 2.4 第三层：行级业务校验
@@ -114,31 +116,36 @@ protected function shouldUpdateField($field)
 
 **资产特有校验：**
 
-1. **资产标签唯一性校验**：
+1. **资产标签唯一性校验：**
+
 ```php
 if ($asset) {
     if (! $this->updating) {
         $exists_error = trans('general.import_asset_tag_exists', ['asset_tag' => $asset_tag]);
         $this->log($exists_error);
         $this->addErrorToBag($asset, 'asset_tag', $exists_error);
-        return $exists_error;  // 资产已存在且非更新模式，跳过该行
+        return $exists_error;
     }
 }
 ```
 
-2. **状态标签默认值处理**：
+2. **状态标签默认值处理：**
+
 ```php
 if (! array_key_exists('status_id', $this->item) && ! $editingAsset) {
     $this->item['status_id'] = $this->defaultStatusLabelId;
 }
 ```
 
-3. **自定义字段处理**：
+3. **自定义字段处理：**
+
 ```php
 foreach ($this->customFields as $customField) {
     $customFieldValue = $this->array_smart_custom_field_fetch($row, $customField);
     if ($customField->field_encrypted == 1) {
         $this->item['custom_fields'][$customField->db_column_name()] = Crypt::encrypt($customFieldValue);
+    } else {
+        $this->item['custom_fields'][$customField->db_column_name()] = $customFieldValue;
     }
 }
 ```
@@ -159,16 +166,14 @@ foreach ($this->customFields as $customField) {
 protected function sanitizeItemForStoring($model, $updating = false)
 {
     $item = collect($this->item);
-    // 1. 只保留模型 fillable 字段
     $item = $item->only($model->getFillable());
-    
-    // 2. 更新模式下移除空值
+
     if ($updating) {
         $item = $item->reject(function ($value) {
             return empty($value);
         });
     }
-    
+
     return $item->toArray();
 }
 ```
@@ -177,21 +182,20 @@ protected function sanitizeItemForStoring($model, $updating = false)
 
 ```php
 if ($editingAsset) {
-    // 更新模式
     $asset->update($item);
     $asset->setImported(true);
-    
-    // 自定义字段单独更新（避免双重保存）
+
     if (! empty($customFieldsToSave)) {
         $asset->update($customFieldsToSave);
     }
 } else {
-    // 创建模式
     $asset->fill($item);
     $asset->setImported(true);
     $success = $asset->save();
 }
 ```
+
+**关键事实：** Asset 模型确实有 `name` 字段，在 `Asset.php:155` 的 fillable 数组中定义。
 
 ### 3.4 自动借出处理 (`AssetImporter.php:215-228`)
 
@@ -200,13 +204,11 @@ if (isset($target) && ($target !== false)) {
     $asset = $asset->fresh();
     $targetType = get_class($target);
     $alreadyCheckedOutToTarget = ($asset->assigned_to == $target->id) && ($asset->assigned_type === $targetType);
-    
+
     if (! $alreadyCheckedOutToTarget) {
-        // 先归还（如果已借出）
         if (! is_null($asset->assigned_to)) {
-            event(new CheckoutableCheckedIn($asset, $asset->assigned, auth()->user(), 'Checkin from CSV Importer', $checkin_date);
+            event(new CheckoutableCheckedIn($asset, $asset->assigned, auth()->user(), 'Checkin from CSV Importer', $checkin_date));
         }
-        // 执行借出
         $asset->checkOut($target, $this->created_by, $checkout_date, null, 'Checkout from CSV Importer', $asset->name);
     }
 }
@@ -226,14 +228,15 @@ if (isset($target) && ($target !== false)) {
 | progressCallback | `progress($count)` | 进度通知 |
 | errorCallback | `errorCallback($item, $field, $errorString)` | 错误聚合 |
 
-**回调注册 (`ItemImportRequest.php:62-67`)：
+**回调注册 (`ItemImportRequest.php:62-67`)：**
+
 ```php
 $importer->setCallbacks([$this, 'log'], [$this, 'progress'], [$this, 'errorCallback'])
 ```
 
 ### 4.2 错误聚合结构
 
-**真实行为澄清：按模型对象的 name 属性聚合，而非固定按记录名！**
+**真实行为：按模型对象的 name 属性聚合！**
 
 ```php
 // ItemImportRequest.php:83-86
@@ -246,12 +249,13 @@ public function errorCallback($item, $field, $errorString)
 **关键说明：**
 - 第一维键是 `$item->name`，其中 `$item` 是**模型对象**
 - 第二维键是 `$field`，含义根据调用场景不同而不同
+- Asset 模型有 `name` 字段（`Asset.php:155`），可正常作为聚合键
 
-**两种调用场景分析：**
+### 4.3 两种错误上报方式
 
-**场景1：`logError($item, $field)` 调用：
+#### 方式1：`logError($item, $field)` 调用 (`Importer.php:293-298`)
+
 ```php
-// Importer.php:293-298
 protected function logError($item, $field)
 {
     if ($this->errorCallback) {
@@ -259,13 +263,21 @@ protected function logError($item, $field)
     }
 }
 ```
+
+**参数说明：**
 - `$item`：模型对象（如 Asset、Category、User 等）
-- `$field`：**描述性字符串**（如 'Asset "笔记本电脑"'、'Category "电子设备"'）
+- `$field`：**描述性字符串**（如 `'Asset "笔记本电脑"'`、`'Category "电子设备"'`）
 - `$errorString`：`$item->getErrors()` 返回的验证错误信息数组
 
-**场景2：`addErrorToBag($item, $field, $error_message)` 调用：
+**实际调用示例 (`AssetImporter.php:232`)：**
+
 ```php
-// Importer.php:300-305
+$this->logError($asset, 'Asset "'.$this->item['name'].'"');
+```
+
+#### 方式2：`addErrorToBag($item, $field, $error_message)` 调用 (`Importer.php:300-305`)
+
+```php
 protected function addErrorToBag($item, $field, $error_message)
 {
     if ($this->errorCallback) {
@@ -273,32 +285,31 @@ protected function addErrorToBag($item, $field, $error_message)
     }
 }
 ```
+
+**参数说明：**
 - `$item`：模型对象
-- `$field`：**字段名**（如 'asset_tag'）
+- `$field`：**字段名**（如 `'asset_tag'`）
 - `$errorString`：自定义错误消息数组
 
-**实际调用示例：
+**实际调用示例 (`AssetImporter.php:95`)：**
 
 ```php
-// 示例1：资产标签已存在（业务错误）
-$this->addErrorToBag($asset, 'asset_tag', '资产标签 NB-001 已存在');
-// 聚合结果：$errors[$asset->name]['asset_tag'] = ['asset_tag' => ['资产标签 NB-001 已存在']]
-
-// 示例2：分类创建失败（模型验证错误）
-$this->logError($category, 'Category "电子设备"');
-// 聚合结果：$errors[$category->name]['Category "电子设备"'] = ['name' => ['名称不能为空']
+$this->addErrorToBag($asset, 'asset_tag', $exists_error);
 ```
 
-**潜在问题：**
-- 聚合键依赖于模型是否有 `name` 属性
-- 对于没有 `name` 字段的模型（如 Asset 模型本身没有 name 字段），可能导致聚合键不稳定
-- 同一名称的多条记录错误会相互覆盖
+### 4.4 错误数据结构示例
 
-### 4.3 错误上报路径
+```php
+// 场景1：资产标签已存在（业务错误）
+$errors['笔记本电脑-001']['asset_tag'] = [
+    'asset_tag' => ['资产标签 NB-001 已存在']
+];
 
-1. **模型验证错误**：`logError($item, $field)` → `errorCallback`
-2. **业务逻辑错误**：`addErrorToBag($item, $field, $message)` → `errorCallback`
-3. **关联创建错误**：各 `createOrFetch*` 方法内部调用 `logError`
+// 场景2：分类创建失败（模型验证错误）
+$errors['电子设备']['Category "电子设备"'] = [
+    'name' => ['名称不能为空']
+];
+```
 
 ---
 
@@ -319,9 +330,9 @@ public function import()
 
         foreach ($this->csv->getRecords($headerRow) as $row) {
             $row = array_change_key_case($row, CASE_LOWER);
-            $this->handle($row);  // 单条记录处理
+            $this->handle($row);
             $importedItemsCount++;
-            
+
             if ($this->progressCallback) {
                 call_user_func($this->progressCallback, $importedItemsCount);
             }
@@ -333,9 +344,7 @@ public function import()
 
 ### 5.2 关键问题：全量事务 vs 行级事务
 
-**当前设计问题：
-
-> **整个导入过程包裹在单个数据库事务中！**
+**当前设计问题：整个导入过程包裹在单个数据库事务中！**
 
 这意味着：
 
@@ -347,65 +356,63 @@ public function import()
 
 #### 场景1：单条记录业务验证失败
 
-**代码路径**：
+**代码路径 (`AssetImporter.php:91-97`)：**
+
 ```php
-// AssetImporter.php:91-97
 if ($asset) {
     if (! $this->updating) {
         $exists_error = trans('general.import_asset_tag_exists', ['asset_tag' => $asset_tag]);
         $this->log($exists_error);
         $this->addErrorToBag($asset, 'asset_tag', $exists_error);
-        return $exists_error;  // 提前返回，不抛出异常
+        return $exists_error;
     }
 }
 ```
 
-**结果**：
+**结果：**
 - 该行被跳过，错误被记录
 - 事务继续执行，后续行正常处理
-- 最终：**部分成功，部分失败，错误被聚合返回
+- 最终：**部分成功，部分失败，错误被聚合返回**
 
 #### 场景2：数据库操作异常（如唯一键冲突）
 
-**代码路径**：模型 `save()` 或 `update()` 抛出 `QueryException`
+**代码路径：** 模型 `save()` 或 `update()` 抛出 `QueryException`
 
-**结果**：
+**结果：**
 - 异常向上冒泡到 `DB::transaction()`
 - 整个事务回滚，**所有已处理记录全部丢失**
 - 用户只能看到通用错误，无法获知哪些行成功了
 
 #### 场景3：关联数据创建失败
 
-**代码路径**：
+**代码路径 (`ItemImporter.php:312-324`)：**
+
 ```php
-// ItemImporter.php:312-324
 public function createOrFetchCategory($asset_category)
 {
     $category = Category::where(['name' => $asset_category, 'category_type' => $item_type])->first();
     if ($category) {
         return $category->id;
     }
-    
+
     $category = new Category;
     $category->name = $asset_category;
     $category->category_type = $item_type;
-    
+
     if ($category->save()) {
         return $category->id;
     }
     $this->logError($category, 'Category "'.$asset_category.'"');
-    return null;  // 返回null，不抛出异常
+    return null;
 }
 ```
 
-**结果**：
+**结果：**
 - 关联ID为 `null`，继续处理主记录
 - 主记录可能因外键约束失败，也可能保存了不完整数据
 - 错误被记录但主流程继续
 
 ### 5.4 字段映射校验对事务边界的影响
-
-**真实行为影响分析：**
 
 字段映射校验发生在事务启动之前（`ItemImportRequest.php:48-58`），这意味着：
 
@@ -414,8 +421,6 @@ public function createOrFetchCategory($asset_category)
 3. **原子性保障**：字段映射校验通过后才会启动事务，确保只有合法的映射配置才会进入实际导入流程
 
 ### 5.5 错误聚合机制对事务边界的影响
-
-**真实行为影响分析：**
 
 错误聚合通过回调机制实现，不依赖于事务状态：
 
@@ -432,23 +437,22 @@ public function createOrFetchCategory($asset_category)
 | **用户体验** | ❌ 较差 | 数据库异常时用户无法获知部分成功数据 |
 | **性能** | ❌ 较差 | 大文件事务持有时间过长 |
 | **可恢复性** | ❌ 差 | 事务回滚后无法断点续传 |
-| **错误定位** | ❌ 差 | 按模型name聚合，同名记录错误会覆盖 |
+| **错误定位** | ⚠️ 一般 | 按模型name聚合，同名记录错误会覆盖 |
 
 ### 5.7 改进建议
 
 **方案A：行级事务（推荐）**
 
 ```php
-// 改进后的 import() 方法
 public function import()
 {
     $headerRow = $this->csv->fetchOne();
     $this->csv->setHeaderOffset(0);
     $this->populateCustomFields($headerRow);
-    
+
     $importedItemsCount = 0;
     Model::unguard();
-    
+
     foreach ($this->csv->getRecords($headerRow) as $row) {
         try {
             DB::transaction(function () use ($row) {
@@ -457,15 +461,14 @@ public function import()
             });
             $importedItemsCount++;
         } catch (\Exception $e) {
-            // 记录单条错误，继续下一条
             $this->log("行 {$importedItemsCount} 处理失败: " . $e->getMessage());
         }
-        
+
         if ($this->progressCallback) {
             call_user_func($this->progressCallback, $importedItemsCount);
         }
     }
-    
+
     Model::reguard();
 }
 ```
@@ -473,7 +476,6 @@ public function import()
 **方案B：批量事务（折中）**
 
 ```php
-// 每100条提交一次事务
 $batchSize = 100;
 $count = 0;
 
@@ -482,7 +484,7 @@ try {
     foreach ($this->csv->getRecords($headerRow) as $row) {
         $this->handle($row);
         $count++;
-        
+
         if ($count % $batchSize === 0) {
             DB::commit();
             DB::beginTransaction();
@@ -491,14 +493,12 @@ try {
     DB::commit();
 } catch (\Exception $e) {
     DB::rollBack();
-    // 记录已成功处理的行数
 }
 ```
 
 **方案C：错误聚合改进**
 
 ```php
-// 改进错误聚合，使用行号作为第一维键
 public function errorCallback($item, $field, $errorString, $lineNumber = null)
 {
     $key = $lineNumber ?? $item->name;
@@ -518,7 +518,7 @@ public function errorCallback($item, $field, $errorString, $lineNumber = null)
 | **字段映射** | 仅做空值检查，无类型匹配，校验通过后才启动事务 | `ItemImportRequest.php:48-58` |
 | **记录写入** | 数据清洗后填充模型，支持创建/更新双模式 | `ItemImporter.php`, `AssetImporter.php` |
 | **错误反馈** | 回调式错误聚合，按模型name属性聚合错误 | `ItemImportRequest.php:83-86`, `Importer.php:293-305` |
-| **事务边界** | ❌ 全局事务包裹，单条失败可能导致全部回滚 | `Importer.php:169` |
+| **事务边界** | 全局事务包裹，单条失败可能导致全部回滚 | `Importer.php:169` |
 
 ### 6.2 设计亮点
 
@@ -530,7 +530,7 @@ public function errorCallback($item, $field, $errorString, $lineNumber = null)
 ### 6.3 主要问题
 
 1. **事务设计缺陷**：全局事务导致数据库异常时全部回滚，用户体验差
-2. **错误聚合粒度不足**：按模型name聚合，同名记录错误会覆盖，无法精确到行号
+2. **错误聚合粒度不足**：按模型name聚合，同名记录错误会覆盖
 3. **缺少进度持久化**：导入中断后无法断点续传
 4. **内存使用未优化**：大文件导入时内存压力大
 5. **字段映射校验简单**：仅做空值检查，无类型预校验
@@ -557,6 +557,7 @@ public function errorCallback($item, $field, $errorString, $lineNumber = null)
 | 错误回调定义 | `app/Http/Requests/ItemImportRequest.php` | 83-86 |
 | logError方法 | `app/Importer/Importer.php` | 293-298 |
 | addErrorToBag方法 | `app/Importer/Importer.php` | 300-305 |
+| Asset的name字段定义 | `app/Models/Asset.php` | 155 |
 | 通用字段解析 | `app/Importer/ItemImporter.php` | 23-100 |
 | 资产创建逻辑 | `app/Importer/AssetImporter.php` | 74-233 |
 | 数据清洗方法 | `app/Importer/ItemImporter.php` | 135-150 |
