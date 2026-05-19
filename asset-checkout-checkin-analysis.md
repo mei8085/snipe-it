@@ -2,472 +2,80 @@
 
 ## 文档概述
 
-本文档基于 Snipe-IT 源代码，从控制层、业务动作层、数据模型层三个维度，逐段分析资产借出与归还的完整链路。重点梳理状态变更规则、接收人与借出记录的绑定关系、以及归还失败与重复归还的异常分支处理依据。
+本文档基于 Snipe-IT 源代码，从**网页入口**、**API 接口入口**、**批量借出入口**三个维度，逐段分析资产借出与归还的完整链路。重点梳理状态变更规则、`assigned_to` 与 `assigned_type` 约束语义、接收人与借出记录的绑定关系、以及归还失败与重复归还的异常分支处理依据。
 
 ---
 
 ## 1. 核心类与文件索引
 
-| 层级 | 文件路径 | 核心职责 |
-|------|---------|---------|
-| 控制层 | `app/Http/Controllers/Assets/AssetCheckoutController.php` | 借出请求入口、参数校验、权限控制、流程编排 |
-| 控制层 | `app/Http/Controllers/Assets/AssetCheckinController.php` | 归还请求入口、参数校验、权限控制、流程编排 |
-| 控制层 | `app/Http/Requests/AssetCheckoutRequest.php` | 借出表单请求验证规则 |
-| 控制层 | `app/Http/Requests/AssetCheckinRequest.php` | 归还表单请求验证规则 |
-| 业务层 | `app/Http/Traits/CheckInOutTrait.php` | 目标解析、位置更新等通用逻辑 |
-| 模型层 | `app/Models/Asset.php` | 资产业务方法（checkOut、状态校验、关联关系） |
-| 模型层 | `app/Models/Statuslabel.php` | 状态标签定义与类型判定 |
-| 模型层 | `app/Models/Traits/Loggable.php` | 操作日志记录（logCheckout、logCheckin、logForceCheckin） |
-| 事件层 | `app/Events/CheckoutableCheckedOut.php` | 借出完成事件 |
-| 事件层 | `app/Events/CheckoutableCheckedIn.php` | 归还完成事件 |
-| 监听层 | `app/Listeners/CheckoutableListener.php` | 通知发送、验收记录创建 |
-| 监听层 | `app/Listeners/LogListener.php` | 操作日志持久化 |
-| 异常层 | `app/Exceptions/CheckoutNotAllowed.php` | 借出不允许异常 |
+| 层级 | 入口类型 | 文件路径 | 核心职责 |
+|------|---------|---------|---------|
+| 控制层 | 网页入口 | `app/Http/Controllers/Assets/AssetCheckoutController.php` | 单个资产网页借出 |
+| 控制层 | 网页入口 | `app/Http/Controllers/Assets/AssetCheckinController.php` | 单个资产网页归还 |
+| 控制层 | 网页入口 | `app/Http/Controllers/Assets/BulkAssetsController.php` | 批量资产网页借出 |
+| 控制层 | API 接口 | `app/Http/Controllers/Api/AssetsController.php` | 资产 REST API 借出/归还 |
+| 请求验证 | 全部 | `app/Http/Requests/AssetCheckoutRequest.php` | 借出表单验证规则 |
+| 请求验证 | 全部 | `app/Http/Requests/AssetCheckinRequest.php` | 归还表单验证规则 |
+| 业务层 | 全部 | `app/Http/Traits/CheckInOutTrait.php` | 目标解析、位置更新通用逻辑 |
+| 模型层 | 全部 | `app/Models/Asset.php` | 资产业务方法（checkOut、状态校验） |
+| 模型层 | 全部 | `app/Models/Statuslabel.php` | 状态标签定义与类型判定 |
+| 事件层 | 单条 | `app/Events/CheckoutableCheckedOut.php` | 单个资产借出事件 |
+| 事件层 | 单条 | `app/Events/CheckoutableCheckedIn.php` | 单个资产归还事件 |
+| 事件层 | 批量 | `app/Events/CheckoutablesCheckedOutInBulk.php` | 批量资产借出事件 |
+| 监听层 | 全部 | `app/Listeners/CheckoutableListener.php` | 通知发送、验收记录处理 |
+| 监听层 | 全部 | `app/Listeners/LogListener.php` | 操作日志持久化 |
+| 异常层 | 全部 | `app/Exceptions/CheckoutNotAllowed.php` | 借出不允许异常 |
 
 ---
 
-## 2. 资产借出链路分析
+## 2. 三类入口对比分析
 
-### 2.1 控制层：借出入口与参数校验
+### 2.1 入口路由与权限
 
-**路由入口：** `POST /hardware/{id}/checkout` → `AssetCheckoutController::store()`
+| 功能 | 网页入口路由 | API 接口路由 | 批量入口路由 |
+|------|-------------|-------------|-------------|
+| 借出表单 | `GET /hardware/{asset}/checkout` | - | `GET /hardware/bulkcheckout` |
+| 提交借出 | `POST /hardware/{asset}/checkout` | `POST /api/v1/hardware/{id}/checkout` | `POST /hardware/bulkcheckout` |
+| 按标签借出 | - | `POST /api/v1/hardware/bytag/{tag}/checkout` | - |
+| 归还表单 | `GET /hardware/{asset}/checkin` | - | - |
+| 提交归还 | `POST /hardware/{asset}/checkin` | `POST /api/v1/hardware/{id}/checkin` | - |
+| 按标签归还 | - | `POST /api/v1/hardware/bytag/{tag}/checkin` | - |
+| 强制归还 | `POST /hardware/{asset}/force-checkin` | - | - |
 
-#### 2.1.1 前置校验阶段
+### 2.2 三类入口在借出流程上的差异
 
-```php
-// app/Http/Controllers/Assets/AssetCheckoutController.php:72-78
-if (! $asset = Asset::find($assetId)) {
-    return redirect()->route('hardware.index')->with('error', trans('admin/hardware/message.does_not_exist'));
-} elseif (! $asset->availableForCheckout()) {
-    return redirect()->route('hardware.index')->with('error', trans('admin/hardware/message.checkout.not_available'));
-}
-$this->authorize('checkout', $asset);
-```
+| 对比项 | 网页入口 (Web UI) | API 接口入口 | 批量借出入口 |
+|--------|------------------|-------------|-------------|
+| **目标解析** | `CheckInOutTrait::determineCheckoutTarget()` | 内联 switch 解析 (Api\AssetsController:1019-1039) | `CheckInOutTrait::determineCheckoutTarget()` |
+| **状态判定** | `availableForCheckout()` 校验 | `availableForCheckout()` 校验 | 1. `hasUndeployableStatus()` 过滤<br>2. `pluck('assigned_to')->unique()->filter()` 批量校验 |
+| **位置写入** | `CheckInOutTrait::updateAssetLocation()` + 子资产级联 | 内联设置 `$asset->location_id` (Api\AssetsController:1022-1036) | `checkOut()` 内 + `withoutEvents` 手动 save (BulkAssetsController:726-732) |
+| **事件触发** | `CheckoutableCheckedOut` (单条) | `CheckoutableCheckedOut` (单条) | `CheckoutablesCheckedOutInBulk` (批量集合) |
+| **计数更新** | `checkOut()` 内 `increment('checkout_counter')` | `checkOut()` 内 `increment('checkout_counter')` | `checkOut()` 内 `increment('checkout_counter')` |
+| **事务包裹** | 无 (单条操作隐含原子性) | `DB::transaction()` 包裹 (Api\AssetsController:1079) | `DB::transaction()` 包裹 (BulkAssetsController:710) |
+| **目标解析** | 解析目标时自动处理位置 | 解析目标时自动处理位置 | `checkOut()` 后手动覆盖位置 |
+| **requestable** | `set_not_requestable` 复选框 | `requestable` 布尔参数 (保留原值除非显式指定) | `set_not_requestable` 复选框 |
+| **响应格式** | Redirect + Session flash | JSON `{status, payload, messages}` | Redirect + Session flash |
 
-**校验顺序：**
-1. 资产存在性校验 → 不存在则重定向到资产列表
-2. 可借出性校验 → 调用 `availableForCheckout()`
-3. 权限校验 → 通过 Laravel Gate 验证 `checkout` 权限
+### 2.3 三类入口在归还流程上的差异
 
-#### 2.1.2 请求验证规则
-
-`AssetCheckoutRequest` 定义表单验证规则：
-
-```php
-// app/Http/Requests/AssetCheckoutRequest.php:28-48
-$rules = [
-    // 三选一目标校验
-    'assigned_user' => 'numeric|nullable|required_without_all:assigned_asset,assigned_location',
-    'assigned_asset' => 'numeric|nullable|required_without_all:assigned_user,assigned_location',
-    'assigned_location' => 'numeric|nullable|required_without_all:assigned_user,assigned_asset',
-    // 状态必须是可部署的
-    'status_id' => 'exists:status_labels,id,deployable,1',
-    'checkout_to_type' => 'required|in:asset,location,user',
-    'checkout_at' => ['nullable', 'date'],
-    'expected_checkin' => ['nullable', 'date'],
-    'set_not_requestable' => 'nullable|boolean',
-];
-```
-
-**关键规则解读：**
-- `required_without_all` 确保必须且只能选择一种接收目标类型
-- `exists:status_labels,id,deployable,1` 确保借出时状态必须是可部署的
-- 系统配置 `require_checkinout_notes` 开启时，`note` 字段必填
-
-### 2.2 业务动作层：目标解析与位置更新
-
-#### 2.2.1 接收目标解析
-
-通过 `CheckInOutTrait::determineCheckoutTarget()` 解析借出目标：
-
-```php
-// app/Http/Traits/CheckInOutTrait.php:15-28
-protected function determineCheckoutTarget(): ?SnipeModel
-{
-    switch (request('checkout_to_type')) {
-        case 'location':
-            return Location::findOrFail(request('assigned_location'));
-        case 'asset':
-            return Asset::findOrFail(request('assigned_asset'));
-        default:
-            return User::findOrFail(request('assigned_user'));
-    }
-}
-```
-
-**目标类型说明：**
-- `user` → 借出给用户（`App\Models\User`）
-- `location` → 借出到位置（`App\Models\Location`）
-- `asset` → 借出给另一资产（`App\Models\Asset`）
-
-#### 2.2.2 资产位置级联更新
-
-借出时根据目标类型自动更新资产位置：
-
-```php
-// app/Http/Traits/CheckInOutTrait.php:37-58
-protected function updateAssetLocation($asset, $target): Asset
-{
-    switch (request('checkout_to_type')) {
-        case 'location':
-            $asset->location_id = $target->id;
-            // 级联更新所有借出给该资产的子资产位置
-            Asset::where('assigned_type', 'App\Models\Asset')->where('assigned_to', $asset->id)
-                ->update(['location_id' => $asset->location_id]);
-            break;
-        case 'asset':
-            $asset->location_id = $target->rtd_location_id;
-            if ($target->location_id != '') {
-                $asset->location_id = $target->location_id;
-            }
-            break;
-        case 'user':
-            $asset->location_id = $target->location_id;
-            break;
-    }
-    return $asset;
-}
-```
-
-**位置更新规则：**
-- 借给位置：位置 = 目标位置 ID，级联更新子资产
-- 借给资产：优先使用目标资产的实际位置，降级使用默认位置
-- 借给用户：位置 = 用户所在位置
-
-#### 2.2.3 多公司隔离校验
-
-启用多公司支持时，确保资产与目标属于同一公司：
-
-```php
-// app/Http/Controllers/Assets/AssetCheckoutController.php:125-129
-if (($settings->full_multiple_companies_support) && 
-    ((! is_null($target->company_id)) && (! is_null($asset->company_id)))) {
-    if ($target->company_id != $asset->company_id) {
-        return redirect()->route('hardware.checkout.create', $asset)
-            ->with('error', trans('general.error_user_company'));
-    }
-}
-```
-
-### 2.3 数据模型层：核心借出逻辑
-
-#### 2.3.1 `checkOut()` 方法执行流程
-
-```php
-// app/Models/Asset.php:521-573
-public function checkOut($target, $admin = null, $checkout_at = null, $expected_checkin = null, $note = null, $name = null, $location = null, bool $signInPlace = false)
-```
-
-**执行步骤：**
-
-| 步骤 | 操作 | 代码位置 |
-|------|------|---------|
-| 1 | 目标存在性校验 | 第523-525行：`if (! $target) { return false; }` |
-| 2 | 自引用检测 | 第526-528行：禁止资产借出给自己 |
-| 3 | 预期归还日期设置 | 第530-532行：`$this->expected_checkin = $expected_checkin` |
-| 4 | 借出时间设置 | 第534行：`$this->last_checkout = $checkout_at` |
-| 5 | 资产名称更新 | 第535行：`$this->name = $name` |
-| 6 | 建立多态关联 | 第537行：`$this->assignedTo()->associate($target)` |
-| 7 | 位置更新 | 第539-548行：根据目标设置位置 |
-| 8 | 保存资产 | 第557行：`if ($this->save())` |
-| 9 | 触发借出事件 | 第565行：`event(new CheckoutableCheckedOut(...))` |
-| 10 | 计数器递增 | 第567行：`$this->increment('checkout_counter', 1)` |
-
-#### 2.3.2 状态变更数据字段
-
-借出操作修改的核心字段：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `assigned_to` | integer | 接收目标 ID |
-| `assigned_type` | string | 接收目标类型（类名） |
-| `last_checkout` | datetime | 借出时间 |
-| `expected_checkin` | date | 预期归还日期 |
-| `location_id` | integer | 当前位置 ID |
-| `status_id` | integer | 状态标签 ID（可选，必须 deployable=1） |
-| `requestable` | boolean | 是否可申请（可选，可设为 false） |
-| `name` | string | 资产名称（可选） |
-| `checkout_counter` | integer | 借出次数计数器（自动 +1） |
-
-#### 2.3.3 多态关联绑定关系
-
-资产与接收人通过 Eloquent MorphTo 多态关联绑定：
-
-```php
-// app/Models/Asset.php:734-737
-public function assignedTo()
-{
-    return $this->morphTo('assigned', 'assigned_type', 'assigned_to')->withTrashed();
-}
-```
-
-**数据库字段设计：**
-- `assigned_to`：目标记录的主键 ID
-- `assigned_type`：目标模型的完整类名（`App\Models\User` / `App\Models\Location` / `App\Models\Asset`）
-- 联合唯一约束：`assigned_to` 与 `assigned_type` 必须同时存在或同时为空
-
-```php
-// app/Models/Asset.php:134-135
-'assigned_to' => ['nullable', 'integer', 'required_with:assigned_type'],
-'assigned_type' => ['nullable', 'required_with:assigned_to', 'in:'.User::class.','.Location::class.','.Asset::class],
-```
-
-### 2.4 事件层：借出后异步处理
-
-#### 2.4.1 事件对象构造
-
-```php
-// app/Events/CheckoutableCheckedOut.php:32-41
-public function __construct(
-    $checkoutable,      // 资产对象
-    $checkedOutTo,      // 接收目标
-    User $checkedOutBy, // 操作人
-    $note,              // 备注
-    $originalValues = [], // 变更前原始值
-    $quantity = 1,
-    bool $signInPlace = false
-)
-```
-
-#### 2.4.2 事件监听处理
-
-`LogListener::onCheckoutableCheckedOut()` 记录操作日志：
-
-```php
-// app/Listeners/LogListener.php:34-41
-public function onCheckoutableCheckedOut(CheckoutableCheckedOut $event)
-{
-    $event->checkoutable->logCheckout(
-        $event->note,
-        $event->checkedOutTo,
-        $event->checkoutable->last_checkout,
-        $event->originalValues,
-        $event->quantity
-    );
-}
-```
-
-`CheckoutableListener::onCheckedOut()` 处理通知与验收：
-
-1. 创建 `CheckoutAcceptance` 验收记录（如资产类别要求验收）
-2. 发送邮件通知给接收人（如有邮箱）
-3. 发送 Webhook 通知（如已配置）
-
-#### 2.4.3 操作日志结构
-
-`logCheckout()` 方法记录完整借出信息：
-
-```php
-// app/Models/Traits/Loggable.php:127-207
-public function logCheckout($note, $target, $action_date = null, $originalValues = [], $quantity = 1)
-```
-
-**日志核心字段：**
-- `item_type` / `item_id`：资产类型与 ID
-- `target_type` / `target_id`：接收目标类型与 ID
-- `action_type`：固定为 `checkout`
-- `location_id`：借出时位置
-- `log_meta`：JSON 格式的变更字段对比（新旧值）
-- `created_by`：操作人 ID
-- `action_date`：操作时间
+| 对比项 | 网页入口 (Web UI) | API 接口入口 | 批量归还 |
+|--------|------------------|-------------|---------|
+| **重复归还检测** | 1. `create()` 入口检测<br>2. `store()` 提交检测 | `store()` 内 `is_null($target)` 检测 | 不支持 (需单条归还) |
+| **位置写入** | `rtd_location_id` + 表单可选覆盖 | `rtd_location_id` + 表单可选覆盖 | 不支持 |
+| **状态更新** | `status_id` + `set_requestable` 联动 | `status_id` + `requestable` 独立 | 不支持 |
+| **事件触发** | `CheckoutableCheckedIn` | `CheckoutableCheckedIn` | 不支持 |
+| **计数更新** | `logCheckin()` 内递增 `checkin_counter` | `logCheckin()` 内递增 `checkin_counter` | 不支持 |
+| **子资产级联** | ✅ 支持 | ✅ 支持 | 不支持 |
+| **许可证清理** | ✅ 支持 | ✅ 支持 | 不支持 |
+| **验收记录删除** | ✅ 支持 | ✅ 支持 | 不支持 |
+| **事务包裹** | 无 | 无 | 不适用 |
+| **响应格式** | Redirect + Session flash | JSON `{status, payload, messages}` | 不适用 |
 
 ---
 
-## 3. 资产归还链路分析
+## 3. 状态变更规则详解
 
-### 3.1 控制层：归还入口与前置校验
-
-**路由入口：** `POST /hardware/{id}/checkin` → `AssetCheckinController::store()`
-
-#### 3.1.1 前置校验链
-
-```php
-// app/Http/Controllers/Assets/AssetCheckinController.php:87-100
-if (is_null($asset = Asset::find($assetId))) {
-    return redirect()->route('hardware.index')->with('error', trans('admin/hardware/message.does_not_exist'));
-}
-if (is_null($target = $asset->assignedTo)) {
-    return redirect()->route('hardware.index')->with('error', trans('admin/hardware/message.checkin.already_checked_in'));
-}
-if (! $asset->model) {
-    return redirect()->route('hardware.show', $asset->id)->with('error', trans('admin/hardware/general.model_invalid_fix'));
-}
-$this->authorize('checkin', $asset);
-```
-
-**校验顺序与异常分支：**
-
-| 校验项 | 失败条件 | 错误消息键 | 处理方式 |
-|--------|---------|-----------|---------|
-| 资产存在性 | `Asset::find()` 返回 null | `admin/hardware/message.does_not_exist` | 重定向到资产列表 |
-| 是否已归还 | `$asset->assignedTo` 为 null | `admin/hardware/message.checkin.already_checked_in` | 重定向到资产列表 |
-| 型号有效性 | `$asset->model` 为 null | `admin/hardware/general.model_invalid_fix` | 重定向到资产详情 |
-| 操作权限 | Gate 拒绝 `checkin` | - | 返回 403 Forbidden |
-
-#### 3.1.2 归还表单验证规则
-
-```php
-// app/Http/Requests/AssetCheckinRequest.php:28-37
-$rules = [
-    'set_requestable' => 'nullable|boolean',
-];
-// 系统配置开启时 note 必填
-if ($settings->require_checkinout_notes) {
-    $rules['note'] = 'string|required';
-}
-```
-
-### 3.2 业务动作层：归还字段更新
-
-#### 3.2.1 核心字段重置
-
-```php
-// app/Http/Controllers/Assets/AssetCheckinController.php:109-111
-$asset->expected_checkin = null;
-$asset->assignedTo()->disassociate($asset);
-$asset->accepted = null;
-```
-
-**字段重置说明：**
-- `expected_checkin`：清空预期归还日期
-- `assignedTo()->disassociate()`：解除多态关联（同时清空 `assigned_to` 和 `assigned_type`）
-- `accepted`：清空验收状态
-
-#### 3.2.2 状态与可申请性联动
-
-```php
-// app/Http/Controllers/Assets/AssetCheckinController.php:114-129
-if ($request->filled('status_id')) {
-    $asset->status_id = e($request->input('status_id'));
-}
-
-$isDeployableStatus = Statuslabel::query()
-    ->whereKey($selectedStatusId)
-    ->where('deployable', 1)
-    ->exists();
-
-if ($request->boolean('set_requestable') && $isDeployableStatus) {
-    $asset->requestable = true;
-}
-```
-
-**业务规则：**
-- 归还时可设置任意状态（无 deployable 限制）
-- 仅当新状态为可部署状态时，才允许将 `requestable` 设为 `true`
-- 状态与可申请性的联动保护防止"不可部署但可申请"的矛盾状态
-
-#### 3.2.3 位置重置逻辑
-
-```php
-// app/Http/Controllers/Assets/AssetCheckinController.php:136-149
-$asset->location_id = $asset->rtd_location_id;
-
-if ($request->has('location_id')) {
-    if ($request->filled('location_id')) {
-        $asset->location_id = $request->input('location_id');
-        if ($request->input('update_default_location') == 0) {
-            $asset->rtd_location_id = $request->input('location_id');
-        }
-    } else {
-        // 显式提交为空 — 清空位置
-        $asset->location_id = null;
-    }
-}
-```
-
-**位置重置优先级：**
-1. 默认重置为资产的默认位置（`rtd_location_id`）
-2. 如表单提交了 `location_id`：
-   - 非空：使用提交值，可选择是否同时更新默认位置
-   - 空字符串：显式清空位置
-
-#### 3.2.4 级联数据清理
-
-```php
-// 许可证座位释放
-$asset->licenseseats->each(function (LicenseSeat $seat) {
-    $seat->update(['assigned_to' => null]);
-});
-
-// 删除待处理验收记录
-$acceptances = CheckoutAcceptance::pending()->whereHasMorph(
-    'checkoutable', [Asset::class],
-    function (Builder $query) use ($asset) {
-        $query->where('id', $asset->id);
-    }
-)->get();
-$acceptances->map(function ($acceptance) {
-    $acceptance->delete();
-});
-```
-
-**级联清理内容：**
-1. 释放所有关联的许可证座位（`assigned_to` 设为 null）
-2. 删除该资产所有待处理（pending）的验收记录
-
-#### 3.2.5 子资产位置级联更新
-
-```php
-// app/Http/Controllers/Assets/AssetCheckinController.php:183-185
-Asset::where('assigned_type', Asset::class)
-    ->where('assigned_to', $asset->id)
-    ->update(['location_id' => $asset->location_id]);
-```
-
-**说明：** 所有借出给该资产的子资产，位置同步更新为父资产的新位置
-
-### 3.3 数据模型层：状态变更字段
-
-归还操作修改的核心字段：
-
-| 字段 | 变更值 | 说明 |
-|------|--------|------|
-| `assigned_to` | null | 解除关联 |
-| `assigned_type` | null | 解除关联 |
-| `expected_checkin` | null | 清空预期归还日期 |
-| `accepted` | null | 清空验收状态 |
-| `last_checkin` | 当前时间 | 设置实际归还时间 |
-| `location_id` | `rtd_location_id` 或表单值 | 重置位置 |
-| `status_id` | 表单值（可选） | 更新状态 |
-| `requestable` | 表单值（可选，需状态可部署） | 更新可申请性 |
-| `checkin_counter` | +1 | 归还次数计数器（在 logCheckin 中递增） |
-
-### 3.4 事件层：归还后异步处理
-
-#### 3.4.1 事件触发
-
-```php
-// app/Http/Controllers/Assets/AssetCheckinController.php:187
-event(new CheckoutableCheckedIn($asset, $target, auth()->user(), $request->input('note'), $checkin_at, $originalValues));
-```
-
-#### 3.4.2 事件监听处理
-
-`LogListener::onCheckoutableCheckedIn()` 记录归还日志：
-
-```php
-// app/Listeners/LogListener.php:23-26
-public function onCheckoutableCheckedIn(CheckoutableCheckedIn $event)
-{
-    $event->checkoutable->logCheckin($event->checkedOutTo, $event->note, $event->action_date, $event->originalValues);
-}
-```
-
-**`logCheckin` 关键操作：**
-- 递增 `checkin_counter` 计数器
-- 记录字段变更差异到 `log_meta`
-- 操作类型标记为 `checkin from`
-
-`CheckoutableListener::onCheckedIn()` 处理通知：
-1. 删除该资产对该用户的所有待处理验收记录
-2. 发送邮件通知给原接收人
-3. 发送 Webhook 通知（如已配置）
-
----
-
-## 4. 状态变更规则详解
-
-### 4.1 状态标签体系
+### 3.1 状态标签体系
 
 `status_labels` 表通过三个布尔字段组合定义状态类型：
 
@@ -495,15 +103,13 @@ public function getStatuslabelType()
 | Undeployable (不可部署) | 0 | 0 | 0 | ❌ 否 | ❌ 否 |
 | Archived (已归档) | 0 | 0 | 1 | ❌ 否 | ❌ 否 |
 
-### 4.2 可借出性判定逻辑
+### 3.2 可借出性判定逻辑
 
 ```php
 // app/Models/Asset.php:468-486
 public function availableForCheckout()
 {
-    // 资产未分配给任何人且未被删除
     if ((! $this->assigned_to) && (! $this->deleted_at)) {
-        // 状态未归档且可部署
         if (($this->status) && ($this->status->archived == '0')
             && ($this->status->deployable == '1')
         ) {
@@ -521,7 +127,7 @@ public function availableForCheckout()
 3. 关联 `status` 存在且 `archived == '0'`（未归档）
 4. 关联 `status` 的 `deployable == '1'`（可部署）
 
-### 4.3 可归还性判定逻辑
+### 3.3 可归还性判定逻辑
 
 ```php
 // app/Models/Asset.php:488-500
@@ -541,208 +147,123 @@ public function availableForCheckIn()
 2. 关联 `status` 存在且 `archived == '0'`（未归档）
 3. 关联 `status` 的 `deployable == '1'`（可部署）
 
-> **注意：** 控制层的校验逻辑与模型方法不一致。控制层仅检查 `is_null($asset->assignedTo)`，不校验状态是否可部署。这意味着即使资产状态已变为不可部署，仍可执行归还操作。
+> **重要差异：** 控制层实际校验逻辑与模型方法不一致。控制层仅检查 `is_null($asset->assignedTo)`，不校验状态是否可部署。这意味着即使资产状态已变为不可部署，仍可执行归还操作。
+
+### 3.4 借出时状态变更规则
+
+**网页入口 & API 接口：**
+```php
+// AssetCheckoutController:102-104 / Api\AssetsController:1041-1043
+if ($request->filled('status_id')) {
+    $asset->status_id = $request->input('status_id');
+}
+```
+
+**批量入口：**
+```php
+// BulkAssetsController:715-717
+if ($request->filled('status_id')) {
+    $asset->status_id = $request->input('status_id');
+}
+```
+
+**约束：** 所有入口均通过 `AssetCheckoutRequest` 验证 `status_id` 必须满足 `deployable = 1`：
+```php
+// app/Http/Requests/AssetCheckoutRequest.php:32
+'status_id' => 'exists:status_labels,id,deployable,1',
+```
+
+### 3.5 归还时状态变更规则
+
+**网页入口：**
+```php
+// AssetCheckinController:114-129
+if ($request->filled('status_id')) {
+    $asset->status_id = e($request->input('status_id'));
+}
+$isDeployableStatus = Statuslabel::query()->whereKey($selectedStatusId)->where('deployable', 1)->exists();
+if ($request->boolean('set_requestable') && $isDeployableStatus) {
+    $asset->requestable = true;
+}
+```
+
+**API 接口：**
+```php
+// Api\AssetsController:1135-1137
+if ($request->filled('status_id')) {
+    $asset->status_id = $request->input('status_id');
+}
+```
+
+**关键规则：**
+- 归还时可设置任意状态（无 `deployable` 限制）
+- 网页入口：`requestable` 与 `deployable` 联动保护（仅可部署状态才可设为可申请）
+- API 入口：`requestable` 无联动保护（需要调用方自行保证一致性）
 
 ---
 
-## 5. 归还失败与重复归还的异常分支依据
+## 4. `assigned_to` 与 `assigned_type` 约束语义
 
-### 5.1 重复归还防护机制
+### 4.1 字段定义与历史演进
 
-**两层防护设计：**
+| 迁移文件 | 时间 | 变更内容 |
+|---------|------|---------|
+| `2016_12_27_212631_make_asset_assigned_to_polymorphic.php` | 2016.12.27 | 新增 `assigned_type` 字段，支持多态关联 |
+| `2017_09_18_225619_fix_assigned_type_not_being_nulled.php` | 2017.09.18 | 修复归还时 `assigned_type` 未清空的 Bug |
+| `2025_06_03_053438_fix_assigned_type_without_assigned_to.php` | 2025.06.03 | 数据一致性修复：清理有 `assigned_type` 无 `assigned_to` 的脏数据 |
 
-#### 第一层：页面入口防护（`create` 方法）
+### 4.2 数据库约束语义
+
+从三次历史迁移可推断出字段的约束语义：
 
 ```php
-// app/Http/Controllers/Assets/AssetCheckinController.php:33-41
-public function create(Asset $asset, $backto = null): View|RedirectResponse
+// 模型验证规则 (app/Models/Asset.php:134-135)
+'assigned_to' => ['nullable', 'integer', 'required_with:assigned_type'],
+'assigned_type' => ['nullable', 'required_with:assigned_to', 
+                   'in:'.User::class.','.Location::class.','.Asset::class],
+```
+
+**约束规则（双向依赖）：**
+1. `assigned_to` 非空时，`assigned_type` 必填
+2. `assigned_type` 非空时，`assigned_to` 必填
+3. `assigned_type` 必须是 `User` / `Location` / `Asset` 三者之一
+4. 两字段必须同时有值或同时为 null
+
+**历史 Bug 修复证明：**
+```php
+// 2017 年迁移：修复归还时 assigned_type 未清空
+Asset::whereNotNull('assigned_type')->whereNull('assigned_to')->update(['assigned_type' => null]);
+
+// 2017 年迁移：修复导入时 assigned_type 未设置
+Asset::whereNotNull('assigned_to')->whereNull('assigned_type')->update(['assigned_type' => User::class]);
+
+// 2025 年迁移：再次清理脏数据
+DB::table('assets')->whereNotNull('assigned_type')->whereNull('assigned_to')->update(['assigned_type' => null]);
+```
+
+### 4.3 多态关联绑定关系
+
+```php
+// app/Models/Asset.php:734-737
+public function assignedTo()
 {
-    $this->authorize('checkin', $asset);
-    // 资产已归还，重定向
-    if (is_null($asset->assignedTo)) {
-        return redirect()->route('hardware.index')
-            ->with('error', trans('admin/hardware/message.checkin.already_checked_in'));
-    }
-    // ...
+    return $this->morphTo('assigned', 'assigned_type', 'assigned_to')->withTrashed();
 }
 ```
 
-**防护点：** 访问归还表单页面前检查，提前拦截已归还资产
+**绑定生命周期：**
 
-#### 第二层：提交接口防护（`store` 方法）
+| 操作 | `assigned_to` | `assigned_type` | 说明 |
+|------|--------------|----------------|------|
+| 创建资产 | null | null | 未借出状态 |
+| 执行借出 | `$target->id` | `$target::class` | 建立多态关联 |
+| 执行归还 | null | null | 解除关联（`disassociate()`） |
+| 强制归还 | null | null | 直接设空（无事件触发） |
+| 删除资产（已借出） | null | 不变 | 仅清空 `assigned_to`（**Bug：未同步清空 `assigned_type`**） |
 
-```php
-// app/Http/Controllers/Assets/AssetCheckinController.php:92-94
-if (is_null($target = $asset->assignedTo)) {
-    return redirect()->route('hardware.index')
-        ->with('error', trans('admin/hardware/message.checkin.already_checked_in'));
-}
-```
+> **潜在 Bug：** API 删除已借出资产时（`Api\AssetsController:930-932`），仅清空 `assigned_to` 未清空 `assigned_type`，违反双向依赖约束。
 
-**防护点：** 提交归还请求时再次检查，防止并发场景下的重复提交
-
-**错误消息：** `admin/hardware/message.checkin.already_checked_in` → "该资产已被归还"
-
-### 5.2 孤立分配与强制归还
-
-#### 5.2.1 孤立分配检测
-
-当借出目标被硬删除（`hard-delete`）时，形成"孤立分配"状态：
-
-```php
-// app/Models/Asset.php:2178-2182
-public function hasOrphanedAssignment(): bool
-{
-    return ($this->assigned_to && ! $this->assigned_type)
-        || ($this->assigned_to && $this->assigned_type && ! $this->assignedTo);
-}
-```
-
-**孤立分配判定条件（满足任一即可）：**
-1. `assigned_to` 有值但 `assigned_type` 为空 → 数据不一致
-2. `assigned_to` 和 `assigned_type` 都有值，但多态关联 `assignedTo` 返回 null → 目标已被硬删除
-
-#### 5.2.2 强制归还流程
-
-**路由：** `POST /hardware/{id}/force-checkin` → `AssetCheckinController::forceCheckin()`
-
-```php
-// app/Http/Controllers/Assets/AssetCheckinController.php:203-225
-public function forceCheckin(Asset $asset)
-{
-    $this->authorize('checkin', $asset);
-
-    // 仅孤立分配可强制归还
-    if (! $asset->hasOrphanedAssignment()) {
-        return redirect()->route('hardware.show', $asset->id)
-            ->with('error', trans('admin/hardware/message.checkin.force_checkin_not_orphaned'));
-    }
-
-    // 仅清空关联字段
-    $asset->assigned_to = null;
-    $asset->assigned_type = null;
-
-    if ($asset->save()) {
-        $asset->logForceCheckin(); // 记录特殊日志
-        return redirect()->route('hardware.show', $asset->id)
-            ->with('success', trans('admin/hardware/message.checkin.force_checkin_orphaned_success'));
-    }
-
-    return redirect()->route('hardware.show', $asset->id)
-        ->with('error', trans('admin/hardware/message.checkin.force_checkin_error'));
-}
-```
-
-#### 5.2.3 普通归还 vs 强制归还对比
-
-| 操作项 | 普通归还 | 强制归还 |
-|--------|---------|---------|
-| 前置条件 | `assignedTo` 非空 | `hasOrphanedAssignment()` 为 true |
-| 解除关联 | `disassociate()` 方法 | 直接设为 null |
-| 清空字段 | expected_checkin, accepted | 仅 assigned_to, assigned_type |
-| 位置重置 | ✅ 是 | ❌ 否 |
-| 状态更新 | ✅ 是 | ❌ 否 |
-| 许可证清理 | ✅ 是 | ❌ 否 |
-| 验收记录删除 | ✅ 是 | ❌ 否 |
-| 子资产级联 | ✅ 是 | ❌ 否 |
-| 计数器递增 | ✅ checkin_counter +1 | ❌ 否 |
-| 事件触发 | ✅ CheckoutableCheckedIn | ❌ 无 |
-| 日志类型 | `checkin from` | `force checkin` |
-| 通知发送 | ✅ 邮件 + Webhook | ❌ 无 |
-
-**强制归还日志记录：**
-
-```php
-// app/Models/Traits/Loggable.php:348-364
-public function logForceCheckin($note = null)
-{
-    $log = new Actionlog;
-    $log = $this->determineLogItemType($log);
-    $log->location_id = null;
-    $log->note = $note;
-    $log->action_date = date('Y-m-d H:i:s');
-    if (auth()->user()) {
-        $log->created_by = auth()->id();
-    }
-    $log->logaction('force checkin'); // 特殊操作类型
-    return $log;
-}
-```
-
-### 5.3 其他归还失败场景
-
-| 失败场景 | 检测代码位置 | 错误处理 |
-|---------|-------------|---------|
-| 资产不存在 | `AssetCheckinController:87-90` | 重定向 + `does_not_exist` 消息 |
-| 资产无型号 | `AssetCheckinController:96-98` | 重定向到详情页 + `model_invalid_fix` 消息 |
-| 无操作权限 | `AssetCheckinController:100` | Gate 授权失败，返回 403 |
-| 模型验证失败 | `$asset->save()` 返回 false | 重定向 + 验证错误消息 |
-| 非孤立资产强制归还 | `AssetCheckinController:208-211` | 重定向 + `force_checkin_not_orphaned` 消息 |
-
----
-
-## 6. 接收人与借出记录的绑定关系
-
-### 6.1 绑定关系数据模型
-
-```
-assets 表
-├─ id (PK)
-├─ asset_tag
-├─ assigned_to      → 目标 ID (integer, nullable)
-├─ assigned_type    → 目标类型 (string, nullable)
-├─ last_checkout    → 借出时间
-├─ expected_checkin → 预期归还时间
-└─ last_checkin     → 实际归还时间
-
-action_logs 表（借出记录）
-├─ id (PK)
-├─ item_type / item_id      → 资产标识
-├─ target_type / target_id  → 接收目标标识
-├─ action_type              → 'checkout' / 'checkin from' / 'force checkin'
-├─ created_by               → 操作人 ID
-├─ action_date              → 操作时间
-└─ log_meta                 → JSON 变更记录
-```
-
-### 6.2 绑定关系生命周期
-
-```
-创建资产
-  ↓
-[assigned_to = null, assigned_type = null]
-  ↓
-执行借出 (checkOut)
-  ↓
-[assigned_to = target.id, assigned_type = target::class]
-[last_checkout = 借出时间]
-  ↓ 写入 action_logs (action_type = 'checkout')
-  ↓
-资产使用中
-  ↓
-执行归还 (checkin)
-  ↓
-[assigned_to = null, assigned_type = null]
-[last_checkin = 归还时间]
-  ↓ 写入 action_logs (action_type = 'checkin from')
-  ↓
-资产可再次借出
-```
-
-### 6.3 历史借出记录查询
-
-```php
-// 所有借出记录
-$asset->checkouts(); // action_type = 'checkout'
-
-// 所有归还记录  
-$asset->checkins();  // action_type = 'checkin from'
-
-// 完整操作日志
-$asset->assetlog();  // 全部 action_type
-```
-
-### 6.4 接收目标类型解析
+### 4.4 接收目标类型解析
 
 ```php
 // app/Models/Asset.php:841-844
@@ -759,110 +280,399 @@ $asset->checkedOutToAsset();    // assigned_type == 'asset'
 
 ---
 
-## 7. 完整调用时序图
+## 5. 借出链路逐段分析
 
-### 7.1 借出流程时序
+### 5.1 网页入口借出流程
 
-```
-HTTP Request
-    ↓ POST /hardware/{id}/checkout
-AssetCheckoutController::store()
-    ├─ 权限校验: authorize('checkout')
-    ├─ 存在性校验: Asset::find()
-    ├─ 可借出性校验: availableForCheckout()
-    ├─ 表单验证: AssetCheckoutRequest
-    ├─ 解析目标: determineCheckoutTarget()
-    ├─ 更新位置: updateAssetLocation()
-    ├─ 多公司校验
-    └─ 执行业务: $asset->checkOut()
-        ├─ 自引用检测
-        ├─ associate($target) 建立关联
-        ├─ 设置字段: last_checkout, expected_checkin
-        ├─ $this->save() 持久化
-        ├─ event(CheckoutableCheckedOut)
-        └─ increment('checkout_counter')
-    ↓
-Event Dispatcher
-    ├─ LogListener::onCheckoutableCheckedOut()
-    │   └─ logCheckout() → action_logs 插入
-    └─ CheckoutableListener::onCheckedOut()
-        ├─ 创建 CheckoutAcceptance (如需)
-        ├─ 发送邮件通知
-        └─ 发送 Webhook 通知
-    ↓
-HTTP Response (Redirect)
-```
-
-### 7.2 归还流程时序
+**路由：** `POST /hardware/{id}/checkout` → `AssetCheckoutController::store()`
 
 ```
-HTTP Request
-    ↓ POST /hardware/{id}/checkin
-AssetCheckinController::store()
-    ├─ 权限校验: authorize('checkin')
-    ├─ 存在性校验: Asset::find()
-    ├─ 已借出校验: is_null(assignedTo) → 防重复归还
-    ├─ 表单验证: AssetCheckinRequest
-    ├─ 字段重置: expected_checkin = null, accepted = null
-    ├─ disassociate() 解除关联
-    ├─ 状态更新: status_id, requestable
-    ├─ 位置重置: location_id = rtd_location_id
-    ├─ 清理许可证座位
-    ├─ 删除待处理验收记录
-    ├─ $asset->save() 持久化
-    ├─ 子资产位置级联更新
-    └─ event(CheckoutableCheckedIn)
+1. 权限校验: authorize('checkout')
+2. 存在性校验: Asset::find($assetId)
+3. 可借出性校验: availableForCheckout()
+4. 表单验证: AssetCheckoutRequest
+   ├─ required_without_all: 三选一目标
+   └─ exists:status_labels,id,deployable,1: 状态必须可部署
+5. 解析目标: CheckInOutTrait::determineCheckoutTarget()
+6. 更新位置: CheckInOutTrait::updateAssetLocation()
+   ├─ 位置: 根据目标类型设置
+   └─ 级联: 更新借出给该资产的子资产位置
+7. 多公司校验: full_multiple_companies_support 时检查公司一致
+8. 执行业务: $asset->checkOut()
+   ├─ 自引用检测: 禁止资产借出给自己
+   ├─ associate($target): 建立多态关联
+   ├─ 设置字段: last_checkout, expected_checkin
+   ├─ save(): 持久化
+   ├─ event(CheckoutableCheckedOut): 触发借出事件
+   └─ increment('checkout_counter'): 计数器 +1
+9. 事件监听
+   ├─ LogListener: logCheckout() 写入 action_logs
+   └─ CheckoutableListener: 创建验收记录 + 发送通知
+10. 响应: redirect()->with('success')
+```
+
+### 5.2 API 接口借出流程
+
+**路由：** `POST /api/v1/hardware/{id}/checkout` → `Api\AssetsController::checkout()`
+
+```
+1. 权限校验: authorize('checkout', Asset::class) → authorize('checkout', $asset)
+2. 存在性校验: Asset::findOrFail($asset_id)
+3. 可借出性校验: availableForCheckout()
+4. 表单验证: AssetCheckoutRequest (同网页)
+5. 内联解析目标 (无 Trait)
+   ├─ location: Location::withoutGlobalScopes()->find()
+   ├─ asset: Asset::withoutGlobalScopes()->where('id', '!=', $asset_id)->find()
+   └─ user: User::withoutGlobalScopes()->find()
+6. 设置位置: $asset->location_id = $target->location_id (无子资产级联)
+7. 设置状态: status_id (如提供)
+8. 设置 requestable: 保留原值除非显式指定
+9. 多公司校验: full_multiple_companies_support 时检查公司一致
+10. 事务包裹: DB::transaction()
+11. 执行业务: $asset->checkOut() (同网页)
+12. 响应: JSON {status: 'success', payload: {...}}
+```
+
+**API 特有差异：**
+- 使用 `withoutGlobalScopes()` 解析目标，绕过全局作用域
+- 无子资产位置级联更新
+- `requestable` 字段行为：保留原值除非显式指定
+- 事务包裹确保原子性
+
+### 5.3 批量借出入口流程
+
+**路由：** `POST /hardware/bulkcheckout` → `BulkAssetsController::storeCheckout()`
+
+```
+1. 权限校验: authorize('checkout', Asset::class)
+2. 解析目标: CheckInOutTrait::determineCheckoutTarget() (同网页)
+3. 选中校验: is_array(selected_assets)
+4. 批量存在性: Asset::findOrFail($asset_ids)
+5. 批量已借出校验: $assets->pluck('assigned_to')->unique()->filter()->isNotEmpty()
+6. 批量多公司校验: 所有资产 company_id 与目标一致
+7. 自引用校验: 目标为资产时，排除目标自身
+8. 事务包裹: DB::transaction()
+9. 循环处理每个资产
+   ├─ 单资产权限: authorize('checkout', $asset)
+   ├─ 设置状态: status_id (如提供)
+   ├─ 设置 requestable: set_not_requestable 时设为 false
+   ├─ 执行业务: $asset->checkOut() (同网页)
+   └─ 手动更新位置: if ($target->location_id != '') { $asset->location_id = ...; withoutEvents()->save(); }
+10. 无错误则触发批量事件: CheckoutablesCheckedOutInBulk::dispatch()
+11. 响应: redirect()->with('success')
+```
+
+**批量特有差异：**
+- 批量已借出校验：一次性检测所有选中资产
+- 位置更新逻辑重复：`checkOut()` 内更新一次，事务内又手动更新一次（`withoutEvents` 禁用事件）
+- 触发批量事件而非单条事件：`CheckoutablesCheckedOutInBulk`
+- 错误收集：合并所有资产的错误后统一返回
+
+---
+
+## 6. 归还链路逐段分析
+
+### 6.1 网页入口归还流程
+
+**路由：** `POST /hardware/{id}/checkin` → `AssetCheckinController::store()`
+
+```
+1. 权限校验: authorize('checkin')
+2. 存在性校验: Asset::find($assetId)
+3. 已借出校验: is_null($asset->assignedTo) → 防重复归还
+4. 型号有效性: $asset->model 非空
+5. 字段重置
+   ├─ expected_checkin = null
+   ├─ assignedTo()->disassociate() → 同时清空 assigned_to 和 assigned_type
+   └─ accepted = null
+6. 状态更新: status_id + requestable 联动保护
+7. 位置重置: location_id = rtd_location_id (可表单覆盖)
+8. 级联清理
+   ├─ 许可证座位: licenseseats->each()->update(['assigned_to' => null])
+   └─ 验收记录: CheckoutAcceptance::pending()->delete()
+9. 数据持久化: $asset->save()
+10. 子资产级联: Asset::where('assigned_type', Asset::class)
+    ->where('assigned_to', $asset->id)->update(['location_id' => ...])
+11. 事件触发: event(CheckoutableCheckedIn)
+12. 事件监听
+    ├─ LogListener: logCheckin() → checkin_counter +1
+    └─ CheckoutableListener: 删除待处理验收 + 发送通知
+13. 响应: redirect()->with('success')
+```
+
+### 6.2 API 接口归还流程
+
+**路由：** `POST /api/v1/hardware/{id}/checkin` → `Api\AssetsController::checkin()`
+
+```
+1. 权限校验: authorize('checkin', $asset)
+2. 存在性校验: Asset::with('model')->findOrFail($asset_id)
+3. 已借出校验: is_null($asset->assignedTo) → 防重复归还
+4. 字段重置 (同网页)
+   ├─ expected_checkin = null
+   ├─ last_checkin = now()
+   ├─ assignedTo()->disassociate()
+   └─ accepted = null
+5. 位置重置: location_id = rtd_location_id (可表单覆盖)
+6. 状态更新: status_id (无 requestable 联动保护)
+7. 级联清理 (同网页)
+   ├─ 许可证座位释放
+   └─ 待处理验收记录删除
+8. 数据持久化: $asset->save()
+9. 子资产级联 (同网页)
+10. 事件触发: event(CheckoutableCheckedIn)
+11. 响应: JSON {status: 'success', payload: {...}}
+```
+
+**API 特有差异：**
+- 设置 `last_checkin = now()`（网页入口在 logCheckin 中通过 action_date 体现）
+- 无 `requestable` 与 `deployable` 联动保护
+- 无 `update_default_location` 参数支持（仅更新 `location_id`，不同步 `rtd_location_id`）
+
+### 6.3 重复归还边界分析
+
+**四层防护机制：**
+
+| 防护层级 | 代码位置 | 检测条件 | 错误处理 |
+|---------|---------|---------|---------|
+| 第一层 | 网页归还表单入口<br>`AssetCheckinController::create()` | `is_null($asset->assignedTo)` | 重定向 + `already_checked_in` |
+| 第二层 | 网页归还提交<br>`AssetCheckinController::store()` | `is_null($target = $asset->assignedTo)` | 重定向 + `already_checked_in` |
+| 第三层 | API 归还提交<br>`Api\AssetsController::checkin()` | `is_null($target = $asset->assignedTo)` | JSON 错误 + `already_checked_in` |
+| 第四层 | 模型方法<br>`Asset::availableForCheckIn()` | `$this->assigned_to != ''` && 状态可部署 | 返回布尔值（控制层未实际调用） |
+
+**重复归还边界定义：**
+- **判定标准：** `$asset->assignedTo === null`
+- **边界条件：**
+  1. `assigned_to` 为 null 或空字符串 → 视为已归还
+  2. `assigned_type` 为 null 但 `assigned_to` 非空 → 脏数据，仍视为已借出
+  3. `assigned_to` 非空但目标已硬删除 → 形成孤立分配（需强制归还）
+
+### 6.4 孤立分配与强制归还
+
+**孤立分配检测：**
+```php
+// app/Models/Asset.php:2178-2182
+public function hasOrphanedAssignment(): bool
+{
+    return ($this->assigned_to && ! $this->assigned_type)
+        || ($this->assigned_to && $this->assigned_type && ! $this->assignedTo);
+}
+```
+
+**强制归还流程：**
+```php
+// app/Http/Controllers/Assets/AssetCheckinController.php:203-225
+public function forceCheckin(Asset $asset)
+{
+    if (! $asset->hasOrphanedAssignment()) {
+        return redirect()->route('hardware.show', $asset->id)
+            ->with('error', trans('admin/hardware/message.checkin.force_checkin_not_orphaned'));
+    }
+    $asset->assigned_to = null;
+    $asset->assigned_type = null;
+    if ($asset->save()) {
+        $asset->logForceCheckin();
+        return redirect()->route('hardware.show', $asset->id)
+            ->with('success', trans('admin/hardware/message.checkin.force_checkin_orphaned_success'));
+    }
+}
+```
+
+**普通归还 vs 强制归还对比：**
+
+| 操作项 | 普通归还 | 强制归还 |
+|--------|---------|---------|
+| 前置条件 | `assignedTo` 非空 | `hasOrphanedAssignment()` 为 true |
+| 解除关联 | `disassociate()` 方法 | 直接设为 null |
+| 清空字段 | expected_checkin, accepted, last_checkout, last_checkin | 仅 assigned_to, assigned_type |
+| 位置重置 | ✅ 是 | ❌ 否 |
+| 状态更新 | ✅ 是 | ❌ 否 |
+| 许可证清理 | ✅ 是 | ❌ 否 |
+| 验收记录删除 | ✅ 是 | ❌ 否 |
+| 子资产级联 | ✅ 是 | ❌ 否 |
+| 计数器递增 | ✅ checkin_counter +1 | ❌ 否 |
+| 事件触发 | ✅ CheckoutableCheckedIn | ❌ 无 |
+| 日志类型 | `checkin from` | `force checkin` |
+| 通知发送 | ✅ 邮件 + Webhook | ❌ 无 |
+
+### 6.5 归还失败场景汇总
+
+| 失败场景 | 检测代码位置 | 错误消息键 |
+|---------|-------------|-----------|
+| 资产不存在 | `AssetCheckinController:87-90` | `admin/hardware/message.does_not_exist` |
+| 资产已归还 | `AssetCheckinController:92-94` | `admin/hardware/message.checkin.already_checked_in` |
+| 资产无型号 | `AssetCheckinController:96-98` | `admin/hardware/general.model_invalid_fix` |
+| 无操作权限 | `AssetCheckinController:100` | Gate 授权失败 403 |
+| 模型验证失败 | `$asset->save()` 返回 false | 验证错误 Bag |
+| 非孤立资产强制归还 | `AssetCheckinController:208-211` | `admin/hardware/message.checkin.force_checkin_not_orphaned` |
+
+---
+
+## 7. 接收人与借出记录的绑定关系
+
+### 7.1 数据模型绑定
+
+```
+assets 表
+├─ id (PK)
+├─ asset_tag
+├─ assigned_to      → 目标 ID (integer, nullable)
+├─ assigned_type    → 目标类型 (string, nullable, morph map)
+├─ last_checkout    → 借出时间
+├─ expected_checkin → 预期归还时间
+├─ last_checkin     → 实际归还时间
+├─ checkout_counter → 借出次数
+└─ checkin_counter  → 归还次数
+
+action_logs 表（操作历史）
+├─ id (PK)
+├─ item_type / item_id      → 资产标识
+├─ target_type / target_id  → 接收目标标识
+├─ action_type              → 'checkout' / 'checkin from' / 'force checkin'
+├─ created_by               → 操作人 ID
+├─ action_date              → 操作时间
+└─ log_meta                 → JSON 格式变更记录
+```
+
+### 7.2 借出记录查询关系
+
+```php
+// 所有借出记录 (action_type = 'checkout')
+$asset->checkouts();
+
+// 所有归还记录 (action_type = 'checkin from')
+$asset->checkins();
+
+// 完整操作日志
+$asset->assetlog();
+
+// 当前接收目标
+$asset->assignedTo; // MorphTo 关联
+
+// 借出记录中目标信息
+$log->target; // action_logs.target_type + target_id 多态关联
+```
+
+### 7.3 绑定关系生命周期
+
+```
+创建资产 [assigned_to = null, assigned_type = null]
     ↓
-Event Dispatcher
-    ├─ LogListener::onCheckoutableCheckedIn()
-    │   └─ logCheckin() → action_logs 插入, checkin_counter +1
-    └─ CheckoutableListener::onCheckedIn()
-        ├─ 删除待处理 Acceptance
-        ├─ 发送邮件通知
-        └─ 发送 Webhook 通知
+执行借出 (checkOut)
     ↓
-HTTP Response (Redirect)
+[assigned_to = target.id, assigned_type = target::class]
+[last_checkout = 借出时间, checkout_counter +1]
+    ↓ 写入 action_logs (action_type = 'checkout')
+    ↓
+资产使用中
+    ↓
+执行归还 (checkin)
+    ↓
+[assigned_to = null, assigned_type = null]
+[last_checkin = 归还时间, checkin_counter +1]
+    ↓ 写入 action_logs (action_type = 'checkin from')
+    ↓
+资产可再次借出
 ```
 
 ---
 
-## 8. 代码设计观察
+## 8. 位置写入规则详解
 
-### 8.1 设计优点
+### 8.1 借出时位置写入
+
+| 入口 | 目标类型 | 位置来源 | 子资产级联 | 代码位置 |
+|------|---------|---------|-----------|---------|
+| 网页 | user | `$target->location_id` | ❌ 否 | `CheckInOutTrait:52-54` |
+| 网页 | location | `$target->id` | ✅ 是 | `CheckInOutTrait:40-43` |
+| 网页 | asset | `$target->location_id` (优先)<br>`$target->rtd_location_id` (降级) | ❌ 否 | `CheckInOutTrait:45-50` |
+| API | user | `$target->location_id` | ❌ 否 | `Api\AssetsController:1035-1036` |
+| API | location | `$target->id` | ❌ 否 | `Api\AssetsController:1022` |
+| API | asset | `$target->location_id` | ❌ 否 | `Api\AssetsController:1029` |
+| 批量 | 全部 | `$target->location_id` (checkOut 内)<br>手动覆盖 (事务内) | ❌ 否 | `BulkAssetsController:726-732` |
+
+### 8.2 归还时位置写入
+
+| 入口 | 默认位置 | 表单覆盖 | 更新默认位置 | 子资产级联 | 代码位置 |
+|------|---------|---------|-------------|-----------|---------|
+| 网页 | `rtd_location_id` | ✅ 是 (location_id 参数) | ✅ 是 (update_default_location = 0) | ✅ 是 | `AssetCheckinController:136-149` |
+| API | `rtd_location_id` | ✅ 是 (location_id 参数) | ✅ 是 (update_default_location = true) | ✅ 是 | `Api\AssetsController:1125-1132` |
+
+---
+
+## 9. 事件与计数更新对比
+
+### 9.1 事件体系
+
+| 场景 | 事件类 | 触发位置 | 监听处理 |
+|------|--------|---------|---------|
+| 单个借出 | `CheckoutableCheckedOut` | `Asset::checkOut():565` | `LogListener::onCheckoutableCheckedOut()` → logCheckout()<br>`CheckoutableListener::onCheckedOut()` → 通知 + 验收 |
+| 批量借出 | `CheckoutablesCheckedOutInBulk` | `BulkAssetsController:741` | 无默认监听（可自定义） |
+| 单个归还 | `CheckoutableCheckedIn` | `AssetCheckinController:187`<br>`Api\AssetsController:1171` | `LogListener::onCheckoutableCheckedIn()` → logCheckin()<br>`CheckoutableListener::onCheckedIn()` → 通知 + 清理 |
+| 删除借出资产 | `CheckoutableCheckedIn` | `Api\AssetsController:929` | 同上 |
+
+### 9.2 计数器更新
+
+| 计数器 | 更新时机 | 更新位置 | 增量 |
+|--------|---------|---------|------|
+| `checkout_counter` | 借出成功后 | `Asset::checkOut():567` | +1 |
+| `checkin_counter` | 归还日志记录时 | `Loggable::logCheckin():164` | +1 |
+
+> **注意：** 强制归还不更新 `checkin_counter`，也不触发事件。
+
+---
+
+## 10. 代码设计观察
+
+### 10.1 设计优点
 
 1. **多态关联设计**：通过 `assigned_to` + `assigned_type` 支持三种借出目标，扩展性强
 2. **事件驱动架构**：核心业务与通知、日志等横切关注点解耦
 3. **多层校验**：控制器入口、模型方法、表单请求三重校验，防御性编程
 4. **级联处理**：借出归还时自动处理子资产、许可证、验收记录等关联数据
 5. **孤立分配处理**：针对硬删除目标的边界场景提供强制归还机制
+6. **事务包裹**：API 和批量操作使用数据库事务确保原子性
 
-### 8.2 潜在改进点
+### 10.2 潜在问题与改进点
 
-1. **校验逻辑不一致**：
-   - 控制层归还校验仅检查 `assignedTo`，不校验状态是否可部署
-   - 模型层 `availableForCheckIn()` 要求状态可部署
-   - 建议统一校验逻辑，避免歧义
+| 问题 | 位置 | 影响 | 建议 |
+|------|------|------|------|
+| 校验逻辑不一致 | 控制层 vs 模型层 `availableForCheckIn()` | 归还时状态校验不严格 | 统一调用模型方法进行校验 |
+| 空值判断不统一 | `availableForCheckout()` vs `availableForCheckIn()` | 语义歧义 | 统一使用 `is_null()` 判断 |
+| 删除时字段不一致 | `Api\AssetsController:930-932` | 违反 `assigned_to`/`assigned_type` 双向依赖 | 删除时同步清空 `assigned_type` |
+| 位置更新重复 | `BulkAssetsController:726-732` | 性能损耗，逻辑冗余 | 移除手动更新，依赖 `checkOut()` 内逻辑 |
+| API 归还无联动 | `Api\AssetsController::checkin()` | 可出现"不可部署但可申请"矛盾状态 | 增加 `requestable` 与 `deployable` 联动校验 |
+| 网页归还无事务 | `AssetCheckinController::store()` | 多次更新无原子性保障 | 增加事务包裹 |
 
-2. **空值判断不统一**：
-   - `availableForCheckout()` 使用 `! $this->assigned_to`
-   - `availableForCheckIn()` 使用 `$this->assigned_to != ''`
-   - 建议统一使用 `is_null()` 进行判断
+### 10.3 历史遗留问题
 
-3. **事务边界缺失**：
-   归还操作涉及多次数据库更新但未使用事务，建议包裹在 `DB::transaction()` 中确保一致性
-
-4. **异常粒度不足**：
-   仅有 `CheckoutNotAllowed` 一个自定义异常，建议细分异常类型便于错误处理
+从三次迁移可以看出 `assigned_type` 字段的历史遗留问题：
+- v4 beta 期间归还时 `assigned_type` 未清空
+- 早期导入器未设置 `assigned_type`
+- 多次数据修复迁移表明该约束曾被多次破坏
 
 ---
 
-## 9. 总结
+## 11. 总结
 
-Snipe-IT 的资产借出归还流程采用经典的 MVC + 事件驱动架构，设计完整且考虑了多种边界场景：
+Snipe-IT 的资产借出归还流程支持三类入口（网页、API、批量），各有特点但共享核心业务逻辑：
 
-1. **状态管理**：通过三维布尔字段组合实现灵活的状态流转，借出时强制可部署状态，归还时状态更新与可申请性联动保护
-2. **关联绑定**：多态关联支持用户、位置、资产三种借出目标，通过 `assigned_to` + `assigned_type` 字段组实现绑定
-3. **异常防护**：两层重复归还检测、孤立分配强制归还机制、自引用检测、循环引用检测等多重边界防护
-4. **级联处理**：位置自动更新、许可证座位释放、验收记录清理、子资产同步等完整的关联数据处理
+### 核心一致性
+- 均调用 `Asset::checkOut()` 执行借出操作
+- 均通过 `disassociate()` 解除关联
+- 均使用 `AssetCheckoutRequest` 进行表单验证
+- 均通过事件系统进行日志记录和通知发送
+
+### 入口差异要点
+1. **状态判定**：批量入口有额外的批量预校验
+2. **位置写入**：网页入口子资产级联最完整，API 入口无子资产级联
+3. **事件触发**：批量入口触发 `CheckoutablesCheckedOutInBulk` 集合事件
+4. **事务包裹**：API 和批量入口使用事务，网页单条操作无事务
+5. **requestable 处理**：API 入口保留原值，网页和批量入口显式设置
+
+### 约束语义澄清
+- `assigned_to` 与 `assigned_type` 是双向依赖约束：必须同时有值或同时为 null
+- 重复归还边界是 `$asset->assignedTo === null`（多态关联返回空）
+- 孤立分配是特殊边界：字段有值但目标记录已不存在，需强制归还
 
 整体设计在灵活性与安全性之间取得了良好平衡，通过事件与监听器模式为后续功能扩展提供了清晰的接口。
