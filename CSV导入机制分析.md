@@ -311,6 +311,76 @@ $errors['电子设备']['Category "电子设备"'] = [
 ];
 ```
 
+### 4.5 字段映射校验失败的特殊路径
+
+#### 4.5.1 触发时机与调用链
+
+字段映射校验发生在事务启动之前（`ItemImportRequest.php:48-58`），此时尚未进入 `Importer::import()` 方法，也没有启动数据库事务。
+
+```php
+// ItemImportRequest.php:48-57
+if ($import->field_map) {
+    foreach ($import->field_map as $field => $fieldValue) {
+        $errorMessage = null;
+
+        if (is_null($fieldValue)) {
+            $errorMessage = trans('validation.import_field_empty', ['fieldname' => $field]);
+            $this->errorCallback($import, $field, [$field => [$errorMessage]]);
+
+            return $this->errors;
+        }
+    }
+}
+```
+
+#### 4.5.2 错误对象的来源
+
+字段映射校验失败时，传入 `errorCallback` 的 `$item` 参数是 **Import 模型对象**，而非业务模型（Asset、Category 等）。
+
+```php
+// 调用时的代码：$this->errorCallback($import, $field, [$field => [$errorMessage]]);
+// 其中 $import 是 Import::find($import_id) 返回的 Import 模型实例
+```
+
+#### 4.5.3 聚合键的生成方式
+
+Import 模型的继承链：`Import` → `Model`（Laravel 基础模型），**不继承** `SnipeModel`。
+
+关键事实：
+- Import 模型本身**没有 `name` 字段**（`Import.php` 的 `$casts` 中只有 `header_row`、`first_row`、`field_map`）
+- 也没有 `getNameAttribute` 访问器
+- 当访问 `$import->name` 时，Laravel 会从 `attributes` 数组中查找 `name` 键
+- 如果 `attributes['name']` 不存在，返回 `null`
+
+因此，字段映射校验失败时的聚合键是 **`null`**。
+
+#### 4.5.4 对可读性的影响
+
+**实际数据结构：**
+
+```php
+// 字段映射校验失败时的错误结构
+$errors[null]['资产标签'] = [
+    '资产标签' => ['字段 "资产标签" 不能为空']
+];
+```
+
+**可读性问题：**
+
+1. **第一维键为 null**：导致错误被归类到 `null` 键下，无法识别是哪个导入任务的错误
+2. **第二维键混用**：此处的 `$field` 是**CSV 列名**（如 "资产标签"），而不是字段名或描述性字符串，与其他场景含义不一致
+3. **无法聚合多个错误**：如果有多个字段映射为空，都会被放入 `null` 键下，后续错误会覆盖前面的错误（因为第二维键可能重复）
+
+#### 4.5.5 与现有错误聚合结论的一致性
+
+字段映射校验失败的错误聚合机制与整体设计**保持一致**：
+
+- 统一使用 `$item->name` 作为第一维聚合键
+- 第二维键 `$field` 的含义同样取决于调用场景（此处为 CSV 列名）
+- 同样存在"同名覆盖"问题（此处表现为多个字段错误共用 `null` 键）
+
+**差异仅在于**：Import 模型没有 name 属性，导致聚合键为 `null`，这是模型设计不一致带来的问题，而非错误聚合机制本身的设计差异。
+
 ---
 
 ## 五、事务边界分析
@@ -531,9 +601,10 @@ public function errorCallback($item, $field, $errorString, $lineNumber = null)
 
 1. **事务设计缺陷**：全局事务导致数据库异常时全部回滚，用户体验差
 2. **错误聚合粒度不足**：按模型name聚合，同名记录错误会覆盖
-3. **缺少进度持久化**：导入中断后无法断点续传
-4. **内存使用未优化**：大文件导入时内存压力大
-5. **字段映射校验简单**：仅做空值检查，无类型预校验
+3. **字段映射错误可读性差**：Import模型无name字段，映射错误聚合键为null
+4. **缺少进度持久化**：导入中断后无法断点续传
+5. **内存使用未优化**：大文件导入时内存压力大
+6. **字段映射校验简单**：仅做空值检查，无类型预校验
 
 ### 6.4 优化优先级
 
@@ -541,6 +612,7 @@ public function errorCallback($item, $field, $errorString, $lineNumber = null)
 |-------|-------|---------|
 | 🔴 高 | 行级事务改造 | 实现真正的部分成功/失败 |
 | 🔴 高 | 错误聚合键改为行号 | 错误可定位到具体CSV行，避免同名覆盖 |
+| 🔴 高 | 字段映射错误修复 | 为Import模型补充标识，解决null键问题 |
 | 🟡 中 | 字段映射类型预校验 | 提前发现类型不匹配问题，避免事务内失败 |
 | 🟡 中 | 进度持久化 | 支持断点续传 |
 | 🟢 低 | 流式处理 | 降低大文件内存占用 |
@@ -558,6 +630,8 @@ public function errorCallback($item, $field, $errorString, $lineNumber = null)
 | logError方法 | `app/Importer/Importer.php` | 293-298 |
 | addErrorToBag方法 | `app/Importer/Importer.php` | 300-305 |
 | Asset的name字段定义 | `app/Models/Asset.php` | 155 |
+| Import模型定义 | `app/Models/Import.php` | 9-17 |
+| 字段映射校验调用errorCallback | `app/Http/Requests/ItemImportRequest.php` | 54 |
 | 通用字段解析 | `app/Importer/ItemImporter.php` | 23-100 |
 | 资产创建逻辑 | `app/Importer/AssetImporter.php` | 74-233 |
 | 数据清洗方法 | `app/Importer/ItemImporter.php` | 135-150 |
