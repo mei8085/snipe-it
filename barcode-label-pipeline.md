@@ -344,28 +344,117 @@ if ($template->getSupport2DBarcode()) {
 
 ### 4.3 display_name 的解析机制
 
-在理解具体取值之前，需要先了解 `display_name` 的魔术方法解析机制：
+`display_name` 是项目中广泛使用的属性，但**不同模型的取值路径完全不同**，这是最容易混淆的地方。
 
-**核心逻辑**: `app/Presenters/Presenter.php:128-135`
+---
+
+#### 4.3.1 两种 accessor 风格
+
+Laravel 支持两种 accessor 风格，项目中同时使用了这两种：
+
+| 风格 | 语法 | 触发方式 |
+|------|------|----------|
+| **旧风格** | `getDisplayNameAttribute()` | 访问 `$model->display_name` 时自动调用 |
+| **新风格** (Laravel 9+) | `displayName(): Attribute` | 访问 `$model->display_name` 时自动调用 |
+
+当两种风格同时存在时，**新风格优先**。
+
+---
+
+#### 4.3.2 `AssetModel` 模型的 display_name（型号的显示名称）
+
+**代码位置**: `app/Models/SnipeModel.php:200-205`（`AssetModel` 继承自 `SnipeModel`）
 
 ```php
-public function __get($property)
+// SnipeModel 中定义的新风格 accessor
+protected function displayName(): Attribute
 {
-    if (method_exists($this, $property)) {
-        return $this->{$property}();
-    }
-    return $this->model->{$property};
+    return Attribute::make(
+        get: fn (mixed $value) => $this->name,
+    );
 }
 ```
 
-当访问 `$model->display_name` 时：
-1. 首先检查 Presenter 类中是否存在 `display_name()` 方法
-2. 如果存在，调用该方法并返回结果
-3. 如果不存在，直接返回底层模型的 `display_name` 属性
+**调用链** (`$asset->model->display_name`):
+1. `$asset->model` → 返回 `AssetModel` 实例
+2. 访问 `->display_name` → 触发 Laravel 的 `__get()` 魔术方法
+3. 查找 accessor → 找到 `SnipeModel::displayName(): Attribute`（新风格，优先级最高）
+4. 执行 accessor → 返回 `$this->name`（即型号名称）
 
-**重要发现**: 
-- `AssetModelPresenter` 中没有定义 `display_name()` 方法
-- 因此 `$asset->model->display_name` 实际返回的是 `$asset->model->name`（即型号名称）
+> **关键点**: 
+> - ✅ **不走 Presenter**！直接走模型 accessor
+> - ✅ 返回值就是 `$asset->model->name`（型号名称）
+> - ❌ 不是 `app/Presenters/Presenter::__get()` 的魔术方法
+
+---
+
+#### 4.3.3 `Asset` 模型的 display_name（资产的显示名称）
+
+**代码位置**: `app/Models/Asset.php:292-295`
+
+```php
+// Asset 中定义的旧风格 accessor
+public function getDisplayNameAttribute()
+{
+    return $this->present()->name();
+}
+```
+
+**调用链** (`$asset->display_name`):
+1. 访问 `$asset->display_name` → 触发 Laravel 的 `__get()` 魔术方法
+2. 查找 accessor → 找到 `Asset::getDisplayNameAttribute()`（旧风格）
+3. 执行 accessor → 调用 `$this->present()->name()`
+4. `present()` 方法 → 来自 `Presentable` trait，返回 `AssetPresenter` 实例
+5. 调用 `AssetPresenter::name()` → 返回格式化的资产名称
+
+> **关键点**: 
+> - ✅ **走 Presenter**！通过 `present()` 方法显式调用
+> - ✅ 返回值是 `AssetPresenter::name()` 的结果（通常是 `asset_tag - name` 格式）
+> - ❌ 不是新风格 accessor
+
+---
+
+#### 4.3.4 为什么 `AssetModel` 不走 Presenter？
+
+`AssetModel` 也使用了 `Presentable` trait，那为什么不走 Presenter 呢？
+
+**Presenter 的调用时机**:
+- Presenter 的 `__get()` 魔术方法**只在访问 `$model->present()->xxx` 时才会触发**
+- 直接访问 `$model->xxx` 走的是 Laravel 的 Eloquent 属性访问流程
+
+**Laravel 属性访问优先级**:
+1. 新风格 accessor (`xxx(): Attribute`) → **最高优先级**
+2. 旧风格 accessor (`getXxxAttribute()`)
+3. 数据库字段值
+4. 关系查询
+5. `__get()` 魔术方法
+
+由于 `SnipeModel` 中定义了新风格的 `displayName(): Attribute`，它的优先级最高，所以会直接走模型 accessor，不会触发 Presenter。
+
+即使没有新风格 accessor，由于 `AssetModelPresenter` 中没有定义 `display_name()` 方法，Presenter 的 `__get()` 最终也会返回 `$this->model->name`，结果是一样的。
+
+---
+
+#### 4.3.5 条码生成中的 display_name
+
+在条码生成代码中 (`app/View/Label.php:319, 322`):
+
+```php
+case 'plain_model_name':
+    $barcode2DTarget = $label2_2d_prefix . ($asset->model->display_name ?? '');
+    break;
+case 'plain_manufacturer_name':
+    $barcode2DTarget = $label2_2d_prefix . $asset->model->display_name;
+    break;
+```
+
+**实际取值路径**:
+- `$asset->model->display_name` → 走 `SnipeModel::displayName()` accessor
+- 返回 `$asset->model->name`（型号名称）
+
+**关键结论**:
+- `plain_model_name` 返回型号名称 ✓ 正确
+- `plain_manufacturer_name` 返回型号名称 ❌ **BUG**（应为 `$asset->model->manufacturer->name`）
 
 ### 4.4 二维码目标字段取值详解与容易混淆的地方
 
@@ -380,7 +469,7 @@ public function __get($property)
 | `plain_asset_tag` | `$asset->asset_tag` | 资产编号 | 资产编号 | ✓ 无混淆 |
 | `plain_serial_number` | `$asset->serial` | 序列号 | 序列号 | ✓ 无混淆 |
 | `plain_model_number` | `$asset->model->model_number` | 型号编号 | 型号编号 | ✓ 无混淆 |
-| `plain_model_name` | `$asset->model->display_name` | 型号名称 (通过Presenter) | 型号名称 | ✓ 正确，但需注意 `display_name` 解析机制 |
+| `plain_model_name` | `$asset->model->display_name` | 型号名称 (SnipeModel accessor) | 型号名称 | ✓ 正确，但需注意 `display_name` 解析机制 |
 | `plain_manufacturer_name` | `$asset->model->display_name` | **型号名称** | **制造商名称** | ⚠️ **严重BUG！代码错误地返回了型号名称，而非制造商名称。正确代码应为 `$asset->model->manufacturer->name`** |
 | `plain_location_name` | `$asset->location->name` | 位置名称 | 位置名称 | ✓ 无混淆 |
 
@@ -445,13 +534,72 @@ AssetsController::getQrCode(Asset $asset)
 
 #### 旧版条码缓存目录
 
-| 条码类型 | 文件路径格式 | 完整路径示例 |
-|---------|------------|-------------|
-| 二维码 | `public/uploads/barcodes/qr-{asset_tag}-{id}.png` | `public/uploads/barcodes/qr-ass-001-42.png` |
-| 一维码 | `public/uploads/barcodes/{type}-{asset_tag}.png` | `public/uploads/barcodes/c128-ass-001.png` |
-| 无效条码占位图 | `public/uploads/barcodes/invalid_barcode.gif` | `public/uploads/barcodes/invalid_barcode.gif` |
+##### 4.6.3.1 `public` 磁盘配置
 
-> **磁盘映射**: `public/uploads/barcodes/` 实际对应 `storage/app/public/barcodes/`（通过 Laravel 的 storage:link 软链接）
+**核心文件**: `config/filesystems.php:52-57, 115`
+
+```php
+'local_public' => [
+    'driver' => 'local',
+    'root' => public_path('uploads'),        // ⚠️ 关键：根目录是 public/uploads/
+    'url' => env('APP_URL').'/uploads',
+    'visibility' => 'public',
+],
+
+// ...
+
+// 将 PUBLIC_FILESYSTEM_DISK 的配置复制到 'public' 键
+$config['disks']['public'] = $config['disks'][env('PUBLIC_FILESYSTEM_DISK', 'local_public')];
+```
+
+> **重要发现**:
+> - 默认 `PUBLIC_FILESYSTEM_DISK` 是 `local_public`
+> - **`public` 磁盘的根目录是 `public/uploads/`**（不是 `storage/app/public/`！）
+> - 不需要 Laravel 的 `storage:link` 软链接
+> - 这是项目自定义的配置，与 Laravel 默认配置不同
+
+##### 4.6.3.2 实际缓存目录路径
+
+| 条码类型 | 文件路径格式（控制器直接写入） | 完整物理路径示例 |
+|---------|-----------------------------|-----------------|
+| 二维码 | `public_path().'/uploads/barcodes/qr-{slug(asset_tag)}-{id}.png'` | `{项目根目录}/public/uploads/barcodes/qr-ass-001-42.png` |
+| 一维码 | `public_path().'/uploads/barcodes/{slug(type)}-{slug(asset_tag)}.png'` | `{项目根目录}/public/uploads/barcodes/c128-ass-001.png` |
+| 无效条码占位图 | `public_path('uploads/barcodes/invalid_barcode.gif')` | `{项目根目录}/public/uploads/barcodes/invalid_barcode.gif` |
+
+**代码证据** (`app/Http/Controllers/Assets/AssetsController.php:626, 664`):
+```php
+// 二维码缓存文件路径
+$qr_file = public_path().'/uploads/barcodes/qr-'.str_slug($asset->asset_tag).'-'.str_slug($asset->id).'.png';
+
+// 一维码缓存文件路径
+$barcode_file = public_path().'/uploads/barcodes/'.str_slug($settings->label2_1d_type).'-'.str_slug($asset->asset_tag).'.png';
+```
+
+##### 4.6.3.3 路径一致性验证
+
+| 操作 | 代码 | 实际路径 |
+|------|------|----------|
+| 控制器写入二维码 | `public_path().'/uploads/barcodes/qr-xxx.png'` | `{项目根目录}/public/uploads/barcodes/qr-xxx.png` |
+| `public` 磁盘根目录 | `Storage::disk('public')->path('')` | `{项目根目录}/public/uploads/` |
+| `public` 磁盘路径拼接 | `Storage::disk('public')->path('barcodes')` | `{项目根目录}/public/uploads/barcodes` |
+| 缓存清理列文件 | `Storage::disk('public')->files('barcodes')` | 列出 `{项目根目录}/public/uploads/barcodes/` 下的文件 |
+| 缓存清理删除 | `Storage::disk('public')->delete('barcodes/qr-xxx.png')` | 删除 `{项目根目录}/public/uploads/barcodes/qr-xxx.png` |
+
+> ✅ **完全一致**！控制器直接写入的路径与 `public` 磁盘配置完全匹配。
+
+##### 4.6.3.4 容易混淆的路径对比
+
+| 概念 | Laravel 默认 | 本项目实际 |
+|------|-------------|-----------|
+| `public` 磁盘 root | `storage/app/public/` | `public/uploads/` |
+| `storage:link` 作用 | 链接 `storage/app/public/` → `public/storage/` | 本项目不需要 |
+| 条码缓存目录 | `storage/app/public/barcodes/` | `public/uploads/barcodes/` |
+| 公开 URL 前缀 | `/storage/` | `/uploads/` |
+
+> **⚠️ 关键区别**:
+> - Laravel 默认使用 `storage/app/public/` 作为 `public` 磁盘，通过软链接到 `public/storage/`
+> - 本项目直接使用 `public/uploads/` 作为 `public` 磁盘，无需软链接
+> - 之前的文档错误地描述为 `storage/app/public/barcodes/`，实际是 `public/uploads/barcodes/`
 
 #### 缓存清理机制
 
@@ -460,11 +608,18 @@ AssetsController::getQrCode(Asset $asset)
 ```php
 public function purgeBarcodes(): JsonResponse
 {
-    $files = Storage::disk('public')->files('barcodes');
+    $file_count = 0;
+    $files = Storage::disk('public')->files('barcodes');  // 列出 public/uploads/barcodes/ 下的文件
     
-    foreach ($files as $file) {
-        $extension = end(explode('.', $file));
+    foreach ($files as $file) { // iterate files
+
+        $file_parts = explode('.', $file);
+        $extension = end($file_parts);
+        Log::debug($extension);
+
+        // Only generated barcodes would have a .png file extension
         if ($extension == 'png') {  // 只删除 .png 缓存文件，保留 .gif 占位图
+            Log::debug('Deleting: '.$file);
             Storage::disk('public')->delete($file);
             $file_count++;
         }
@@ -475,6 +630,8 @@ public function purgeBarcodes(): JsonResponse
 ```
 
 > **设计意图**: 当条码类型设置变更或系统 URL 变更时，需要清除缓存以重新生成条码。清除后下次访问时会自动重新生成。
+>
+> **路径说明**: `Storage::disk('public')->files('barcodes')` 实际上列出的是 `public/uploads/barcodes/` 目录，与控制器写入路径完全一致。
 
 ### 4.7 新旧版条码生成的差异与协作关系
 
@@ -541,7 +698,7 @@ public function purgeBarcodes(): JsonResponse
    - 旧版标签的 `<img>` 标签
    - 其他可能需要独立条码图片的场景
 
-4. **缓存目录共存**: 旧版缓存目录 `storage/app/public/barcodes/` 始终存在：
+4. **缓存目录共存**: 旧版缓存目录 `public/uploads/barcodes/` 始终存在：
    - 新版不使用缓存目录，也不修改其中的文件
    - `purgeBarcodes()` API 只清除旧版缓存的 `.png` 文件
    - `invalid_barcode.gif` 占位图不会被清除
@@ -584,18 +741,30 @@ if ($template->getSupportLogo()) {
 
 ### 5.2 Logo 存储路径详解
 
-所有 Logo 图片都存储在 `public` 磁盘（即 `storage/app/public/`）下，通过 Laravel 的 `storage:link` 软链接到 `public/storage/` 目录。
+所有 Logo 图片都存储在 `public` 磁盘（即 `public/uploads/`）下，**无需 Laravel 的 `storage:link` 软链接**。
 
-| Logo 类型 | 存储路径格式 | 实际文件路径示例 | 数据库字段值示例 |
-|-----------|-------------|-----------------|-----------------|
-| 公司 Logo | `companies/{filename}` | `storage/app/public/companies/acme-corp-abc123.png` | `companies/acme-corp-abc123.png` |
-| 全局标签 Logo | `/{filename}` (存储在 public 磁盘根目录) | `storage/app/public/setting-label_logo-1-xyz789.png` | `setting-label_logo-1-xyz789.png` |
-| 预览占位图 | `public_path()` 目录 | `public/img/label-preview-logo.png` | (硬编码，不存数据库) |
+| Logo 类型 | 存储路径格式 (相对于 public 磁盘 root) | 实际文件路径示例 | 数据库字段值示例 |
+|-----------|-------------------------------------|-----------------|-----------------|
+| 公司 Logo | `companies/{filename}` | `{项目根目录}/public/uploads/companies/acme-corp-abc123.png` | `companies/acme-corp-abc123.png` |
+| 全局标签 Logo | `/{filename}` (存储在 public 磁盘根目录) | `{项目根目录}/public/uploads/setting-label_logo-1-xyz789.png` | `setting-label_logo-1-xyz789.png` |
+| 预览占位图 | `public_path()` 目录 (非 public 磁盘) | `{项目根目录}/public/img/label-preview-logo.png` | (硬编码，不存数据库) |
+
+**路径解析证据**:
+```php
+// 公司 Logo 路径解析
+Storage::disk('public')->path('companies/'.e($asset->company->image));
+// 解析为: {项目根目录}/public/uploads/companies/acme-corp-abc123.png
+
+// 全局标签 Logo 路径解析  
+Storage::disk('public')->path('/'.e(basename($settings->label_logo)));
+// 解析为: {项目根目录}/public/uploads/setting-label_logo-1-xyz789.png
+```
 
 > **关键注意**:
 > 1. 全局标签 Logo 的文件名格式：`setting-label_logo-{setting_id}-{random_str}.{ext}`，由 `ImageUploadRequest::handleImages()` 方法生成
 > 2. 代码中使用 `basename($settings->label_logo)` 提取文件名，确保只取文件名部分
 > 3. TCPDF 的 `Image()` 方法需要 **绝对文件系统路径**，而非 URL。代码中使用 `Storage::disk('public')->path()` 获取实际文件路径
+> 4. `public` 磁盘的 root 是 `public/uploads/`，不是 `storage/app/public/`
 
 ### 5.3 条码缓存目录（旧版）
 
@@ -603,14 +772,15 @@ if ($template->getSupportLogo()) {
 
 | 条码类型 | 存储路径格式 | 实际文件路径示例 |
 |---------|-------------|-----------------|
-| 二维码 | `barcodes/qr-{asset_tag}-{id}.png` | `storage/app/public/barcodes/qr-ass-001-42.png` |
-| 一维码 | `barcodes/{type}-{asset_tag}.png` | `storage/app/public/barcodes/c128-ass-001.png` |
-| 无效条码占位图 | `barcodes/invalid_barcode.gif` | `storage/app/public/barcodes/invalid_barcode.gif` |
+| 二维码 | `barcodes/qr-{slug(asset_tag)}-{id}.png` | `{项目根目录}/public/uploads/barcodes/qr-ass-001-42.png` |
+| 一维码 | `barcodes/{slug(type)}-{slug(asset_tag)}.png` | `{项目根目录}/public/uploads/barcodes/c128-ass-001.png` |
+| 无效条码占位图 | `barcodes/invalid_barcode.gif` | `{项目根目录}/public/uploads/barcodes/invalid_barcode.gif` |
 
 > **存储逻辑**:
 > - 首次访问 `/hardware/{id}/qr_code` 或 `/hardware/{id}/barcode` 时生成图片并写入缓存
 > - 后续访问直接读取缓存文件
 > - `purgeBarcodes()` API 只删除 `.png` 文件，保留 `.gif` 占位图
+> - **⚠️ 重要**: 缓存目录是 `public/uploads/barcodes/`，不是 `storage/app/public/barcodes/`
 
 ### 5.4 新旧版图片输出机制对比
 
@@ -680,13 +850,14 @@ final public function writeImage(TCPDF $pdf, $image, $x, $y, $width = null, $hei
 | Logo 路径 | `Storage::disk('public')->path($file)` → 绝对文件路径 | `Storage::disk('public')->url($file)` → HTTP URL |
 | 条码路径 | 直接绘制到 PDF，无文件 | `/hardware/{id}/qr_code` → HTTP URL → 缓存文件 |
 | 图片格式 | 直接嵌入 PDF | PNG/GIF 图片文件 |
-| 缓存机制 | 无缓存 | 条码缓存到 `storage/app/public/barcodes/` |
+| 缓存机制 | 无缓存 | 条码缓存到 `public/uploads/barcodes/` |
 
 > **容易混淆的地方**:
 > - `path()` 方法返回**文件系统绝对路径**（用于 TCPDF 读取）
 > - `url()` 方法返回**公开访问 URL**（用于 HTML 引用）
 > - 两者指向同一个物理文件，但用途完全不同
 > - 条码缓存目录 `barcodes/` 只被旧版系统使用，新版系统不生成也不依赖这些缓存文件
+> - `public` 磁盘的 root 是 `public/uploads/`，不是 `storage/app/public/`
 
 ---
 
@@ -709,7 +880,7 @@ Collection {
     'id' => 42,
     'tag' => 'ASS-0042',
     'title' => 'ACME Corp 资产标签',
-    'logo' => '/var/www/storage/app/public/companies/acme.png',
+    'logo' => '/var/www/public/uploads/companies/acme.png',
     'barcode2d' => {
         'type' => 'QRCODE,L',
         'content' => 'https://snipe.example.com/hardware/42'
@@ -768,7 +939,9 @@ Collection {
 | `app/Http/Controllers/Assets/AssetsController.php` | **旧版条码生成控制器** - getQrCode(), getBarCode() 方法 |
 | `app/Http/Controllers/Api/SettingsController.php` | **缓存清理控制器** - purgeBarcodes() 方法 |
 | `app/Http/Requests/ImageUploadRequest.php` | 图片上传处理，生成 label_logo 文件名 |
-| `app/Presenters/Presenter.php` | Presenter 基类，定义 `__get()` 魔术方法解析 display_name |
+| `app/Presenters/Presenter.php` | Presenter 基类，定义 `__get()` 魔术方法 |
+| `app/Models/SnipeModel.php` | 定义新风格 `displayName(): Attribute` accessor |
+| `config/filesystems.php` | 定义 `public` 磁盘配置，root 为 `public/uploads/` |
 | `resources/views/hardware/labels.blade.php` | 旧版 HTML 标签模板 |
 
 ---
@@ -794,15 +967,85 @@ case 'plain_manufacturer_name':
 | 概念 | 说明 |
 |------|------|
 | `path()` vs `url()` | `path()` 返回文件系统绝对路径（供 TCPDF 读取），`url()` 返回公开访问 URL（供 HTML 引用） |
-| `display_name` 解析 | 通过 Presenter 的 `__get()` 魔术方法，先检查是否有同名方法，再返回模型属性 |
+| `display_name` 解析（AssetModel） | **不走 Presenter**！走 `SnipeModel::displayName(): Attribute` 新风格 accessor，直接返回 `$this->name` |
+| `display_name` 解析（Asset） | **走 Presenter**！通过 `Asset::getDisplayNameAttribute()` 旧风格 accessor 调用 `$this->present()->name()` |
+| `public` 磁盘 root | 项目自定义为 `public/uploads/`，**不是** Laravel 默认的 `storage/app/public/`，无需 `storage:link` |
 | `label2_2d_target` 选项 | 10 个选项中 `plain_manufacturer_name` 存在 BUG，其余正常 |
-| 条码缓存目录 | `storage/app/public/barcodes/` 只被旧版系统使用，新版 PDF 系统不生成缓存文件 |
+| 条码缓存目录 | `public/uploads/barcodes/` 只被旧版系统使用，新版 PDF 系统不生成缓存文件 |
 | 新旧版二维码内容 | 旧版固定为资产详情 URL，新版根据 `label2_2d_target` 配置生成 |
 
-### 9.3 新旧版协作要点
+### 9.3 新旧版目录机制的关系
+
+#### 9.3.1 目录结构对比
+
+| 目录/文件 | 所属系统 | 物理路径 | 说明 |
+|----------|---------|----------|------|
+| `barcodes/` | 旧版 | `{项目根目录}/public/uploads/barcodes/` | 条码缓存目录，只被旧版使用 |
+| `companies/` | 共享 | `{项目根目录}/public/uploads/companies/` | 公司 Logo 目录，新旧版都使用（新版读路径，旧版读 URL） |
+| `setting-label_logo-*` | 共享 | `{项目根目录}/public/uploads/` | 全局标签 Logo，新旧版都使用 |
+| `label-preview-logo.png` | 新版 | `{项目根目录}/public/img/` | 预览占位图，只被新版使用 |
+
+#### 9.3.2 新版与旧版目录机制的协作
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    public 磁盘: public/uploads/                   │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
+│  │ barcodes/   │    │ companies/  │    │ setting-label_logo  │  │
+│  │ (旧版缓存)  │    │ (共享)      │    │ (共享)              │  │
+│  └──────┬──────┘    └──────┬──────┘    └──────────┬──────────┘  │
+└─────────┼──────────────────┼──────────────────────┼─────────────┘
+          │                  │                      │
+          │ 只读/不写        │ 读绝对路径           │ 读绝对路径
+          ▼                  ▼                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     新版 PDF 标签系统 (label2_enable=1)           │
+│  - 条码: TCPDF 直接矢量绘制，不生成文件                            │
+│  - Logo: Storage::disk('public')->path() 读取绝对路径嵌入 PDF     │
+│  - 无缓存，无额外文件输出                                        │
+└─────────────────────────────────────────────────────────────────┘
+
+          │                  │                      │
+          │ 写+读缓存        │ 读 URL               │ 读 URL
+          ▼                  ▼                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     旧版 HTML 标签系统 (label2_enable=0)          │
+│  - 条码: 访问 /hardware/{id}/qr_code 路由生成 PNG 并写入缓存      │
+│  - Logo: Storage::disk('public')->url() 生成公开 URL 给 HTML     │
+│  - 缓存文件: public/uploads/barcodes/*.png                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.3.3 关键协作点
+
+1. **`public` 磁盘共享**：两套系统共享同一个 `public` 磁盘配置（root = `public/uploads/`）
+   - 新版用 `path()` 获取绝对文件路径（供 TCPDF 读取）
+   - 旧版用 `url()` 获取公开 URL（供 HTML `<img>` 引用）
+   - 两者指向同一个物理文件
+
+2. **条码缓存目录独立**：`public/uploads/barcodes/` 只被旧版系统使用
+   - 新版不生成条码图片，不写入也不读取此目录
+   - 新版条码直接通过 TCPDF 矢量绘制到 PDF，无中间文件
+
+3. **Logo 目录共享**：`companies/` 和全局标签 Logo 被两套系统共享
+   - 新版：`Storage::disk('public')->path('companies/xxx.png')` → 绝对路径
+   - 旧版：`Storage::disk('public')->url('companies/xxx.png')` → HTTP URL
+
+4. **文件操作权限隔离**：
+   - 旧版控制器直接用 `file_put_contents()` 写入 `public/uploads/barcodes/`
+   - 新版只用 `getimagesize()` 读取 Logo 文件，不写入任何文件
+   - `purgeBarcodes()` API 通过 `Storage::disk('public')` 删除旧版缓存
+
+5. **路径一致性保证**：
+   - 控制器写入：`public_path().'/uploads/barcodes/xxx.png'`
+   - Storage 操作：`Storage::disk('public')->files('barcodes')`
+   - 两者路径完全一致（都指向 `public/uploads/barcodes/`）
+
+### 9.4 新旧版协作要点
 
 1. 两套系统共享条码类型配置，但只有新版使用 `label2_2d_target`
 2. 独立路由 `/hardware/{id}/qr_code` 和 `/hardware/{id}/barcode` 始终可用，与 `label2_enable` 无关
 3. `purgeBarcodes()` API 只清除旧版缓存的 `.png` 文件，不影响新版
 4. `barcodes/` 缓存目录始终存在，新版不使用但也不清理
 5. 切换 `label2_enable` 即可在两套系统间切换，无需其他配置变更
+6. 两套系统共享同一个 `public` 磁盘（`public/uploads/`），但使用方式不同（新版读路径，旧版读 URL + 写缓存）
