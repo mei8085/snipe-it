@@ -1,5 +1,146 @@
 # 资产申请-审批-通知 状态流分析
 
+---
+
+## 零、事实校准
+
+本章节对之前分析中的关键偏差进行校正，详细列出更正前后的对比。
+
+### 0.1 审批页面 Cancel 按钮的实际跳转路径
+
+**更正前**：
+> 取消申请表单提交到 `POST /request/{itemType}/{itemId}/true/{requestingUser}`
+
+**更正后**：
+> 取消申请表单提交到路由 `route('account/request-item')`，实际路径为：
+> `POST /request/{itemType}/{itemId}/{cancel_by_admin?}/{requestingUser?}`
+>
+> 路由名称：`account/request-item`（注意是斜杠分隔，不是点分隔）
+> 控制器方法：`ViewAssetsController::getRequestItem()`
+
+**完整链路**：
+```
+1. requested.blade.php:93-105
+   <form method="POST" action="{{ route('account/request-item', [
+       $request->itemType(),
+       $request->requestable->id,
+       true,                          // cancel_by_admin = true
+       $request->requestingUser()->id  // 指定要取消的申请人
+   ]) }}">
+
+2. routes/web.php:412-413
+   Route::post('request/{itemType}/{itemId}/{cancel_by_admin?}/{requestingUser?}',
+       [ViewAssetsController::class, 'getRequestItem'])
+       ->name('account/request-item');
+
+3. ViewAssetsController::getRequestItem():202-211
+   判断 $cancel_by_admin = true → 执行取消逻辑
+```
+
+---
+
+### 0.2 审批页 Cancel 按钮 vs CancelCheckoutRequestAction 差异
+
+| 对比项 | 审批页 Cancel 按钮 (`getRequestItem`) | CancelCheckoutRequestAction (API) |
+|--------|---------------------------------------|------------------------------------|
+| **调用方式** | Web 表单提交，路由 `account/request-item` | API 调用，`DELETE /api/v1/account/request/{asset}` |
+| **计数器处理** | ❌ **不处理** `requests_counter` | ✅ `$asset->decrement('requests_counter', 1)` |
+| **权限检查** | ❌ 无公司权限检查 | ✅ `Company::isCurrentUserHasAccess($asset)` |
+| **通知触发条件** | ✅ 三重检查：<br>`alert_email != '' && alerts_enabled == '1' && !lock_passwords` | ❌ 无条件发送（try-catch 包裹） |
+| **通知 locale** | ✅ `->locale($settings->locale)` | ❌ 未设置 locale |
+| **日志行为** | ✅ `ActionType::RequestCanceled`（枚举） | ✅ `'request canceled'`（字符串） |
+| **支持类型** | ✅ Asset / AssetModel | ❌ 仅 Asset |
+| **指定申请人** | ✅ `$item->cancelRequest($requestingUser)`<br>可指定取消任意用户的申请 | ❌ `$asset->cancelRequest()`<br>无参数，取消当前用户的申请 |
+| **申请数量** | ✅ 从 `$item_request->qty` 获取实际数量 | ❌ 固定为 1 |
+| **异常处理** | ❌ 无 try-catch 包裹通知发送 | ✅ 用 try-catch 包裹，异常记录日志 |
+
+**代码位置对比**：
+- 审批页 Cancel：`app/Http/Controllers/ViewAssetsController.php:202-211`
+- API CancelAction：`app/Actions/CheckoutRequests/CancelCheckoutRequestAction.php:15-46`
+
+---
+
+### 0.3 checkout/checkin 邮件链路：Mailable vs Notification
+
+**更正前**：
+> `CheckoutAssetNotification` 用于发送邮件给借用人和管理员
+
+**更正后**：
+> checkout/checkin 的**邮件发送**和 **webhook 通知**使用**完全独立**的两套类：
+>
+> - **邮件链路**：使用 `Mailable` 类（`CheckoutAssetMail` 等）
+> - **Webhook 链路**：使用 `Notification` 类（`CheckoutAssetNotification` 等）
+>
+> 且 `CheckoutAssetNotification` 的 `via()` 方法**不包含 'mail' 渠道**，只用于 webhook 通知。
+
+**完整链路对比**：
+
+| 维度 | 邮件链路 (Mailable) | Webhook 链路 (Notification) |
+|------|---------------------|------------------------------|
+| **触发点** | `CheckoutableListener@onCheckedOut`:94-124 | `CheckoutableListener@onCheckedOut`:127-164 |
+| **使用类** | `CheckoutAssetMail`, `CheckinAssetMail` | `CheckoutAssetNotification`, `CheckinAssetNotification` |
+| **类位置** | `app/Mail/` 目录 | `app/Notifications/` 目录 |
+| **基类** | 继承 `BaseMailable` | 继承 `Notification` |
+| **发送方式** | `Mail::to()->send($mailable)` | `Notification::route()->notify($notification)` |
+| **获取方法** | `getCheckoutMailType()` → `CheckoutAssetMail::class` | `getCheckoutNotification()` → `CheckoutAssetNotification::class` |
+| **通知渠道** | 仅邮件 (SMTP/Mailgun/Sendmail 等) | Slack / Microsoft Teams / Google Chat |
+| **toMail 方法** | 有 `content()` / `envelope()` 方法 | ❌ **没有** `toMail()` 方法 |
+| **via() 返回** | 不适用 (Mailable) | 只返回 webhook 渠道，**不含 'mail'** |
+
+**关键代码证据**：
+
+`CheckoutAssetNotification::via()` (`app/Notifications/CheckoutAssetNotification.php:59-80`)：
+```php
+public function via()
+{
+    $notifyBy = [];
+    // 只添加 webhook 渠道，不包含 'mail'
+    if (Setting::getSettings()->webhook_selected === 'google' && Setting::getSettings()->webhook_endpoint) {
+        $notifyBy[] = GoogleChatChannel::class;
+    }
+    if (Setting::getSettings()->webhook_selected === 'microsoft' && Setting::getSettings()->webhook_endpoint) {
+        $notifyBy[] = MicrosoftTeamsChannel::class;
+    }
+    if (Setting::getSettings()->webhook_selected === 'slack' || Setting::getSettings()->webhook_selected === 'general') {
+        $notifyBy[] = SlackWebhookChannel::class;
+    }
+    return $notifyBy; // 不包含 'mail'
+}
+```
+
+`CheckoutableListener@onCheckedOut()` 中的双链路：
+```php
+// 链路 1：邮件发送 - 使用 Mailable
+if ($shouldSendEmailToUser || $shouldSendEmailToAlertAddress) {
+    $mailable = $this->getCheckoutMailType($event, $acceptance); // 返回 CheckoutAssetMail
+    // ...
+    Mail::to(array_flatten($to))->send($toMail);
+    Mail::cc(array_flatten($cc))->send($ccMail);
+}
+
+// 链路 2：Webhook 通知 - 使用 Notification
+if ($shouldSendWebhookNotification) {
+    $notification = $this->getCheckoutNotification($event, $acceptance, true); // 返回 CheckoutAssetNotification
+    // ...
+    Notification::route(...)->notify($notification);
+}
+```
+
+---
+
+### 0.4 更正后的通知类型与触发时机
+
+| 通知类 | 类型 | 触发时机 | 渠道 | 接收者 |
+|--------|------|---------|------|--------|
+| `RequestAssetNotification` | Notification | 用户提交申请时 | 邮件 + Webhook | reply_to 地址 |
+| `RequestAssetCancelation` | Notification | 申请被取消时 | 邮件 + Webhook | reply_to 地址 |
+| `CheckoutAssetMail` | Mailable | 资产 checkout 成功时 | 邮件 | 借用人 + admin_cc_email |
+| `CheckinAssetMail` | Mailable | 资产 checkin 成功时 | 邮件 | 借用人 + admin_cc_email |
+| `CheckoutAssetNotification` | Notification | 资产 checkout 成功时 | Webhook | Slack/Teams/Google Chat |
+| `CheckinAssetNotification` | Notification | 资产 checkin 成功时 | Webhook | Slack/Teams/Google Chat |
+
+---
+
 ## 一、核心数据模型
 
 ### CheckoutRequest 模型
@@ -149,16 +290,20 @@
 
 ### 通知类型与触发时机
 
-| 通知类 | 触发时机 | 接收者 | 邮件主题 |
-|--------|---------|--------|---------|
-| `RequestAssetNotification` | 用户提交申请时 | alert_email | 👀 Item Requested |
-| `RequestAssetCancelation` | 申请被取消时 | alert_email | ⚠️ Request Canceled |
-| `CheckoutAssetNotification` | 资产 checkout 成功时 | 借用人 / admin_cc_email | Asset Checkout Notification |
-| `CheckinAssetNotification` | 资产 checkin 成功时 | 借用人 / admin_cc_email | Asset Checkin Notification |
+> ⚠️ **重要区分**：checkout/checkin 的邮件和 Webhook 使用**完全独立**的两套类。
+
+| 类名 | 类型 | 触发时机 | 渠道 | 接收者 | 主题 |
+|------|------|---------|------|--------|------|
+| `RequestAssetNotification` | Notification | 用户提交申请时 | 邮件 + Webhook | reply_to 地址 | 👀 Item Requested |
+| `RequestAssetCancelation` | Notification | 申请被取消时 | 邮件 + Webhook | reply_to 地址 | ⚠️ Request Canceled |
+| `CheckoutAssetMail` | Mailable | 资产 checkout 成功时 | 邮件 | 借用人 + admin_cc_email | Asset Checkout Notification |
+| `CheckinAssetMail` | Mailable | 资产 checkin 成功时 | 邮件 | 借用人 + admin_cc_email | Asset Checkin Notification |
+| `CheckoutAssetNotification` | Notification | 资产 checkout 成功时 | Webhook | Slack/Teams/Google Chat | :arrow_up: :computer: Asset Checkout |
+| `CheckinAssetNotification` | Notification | 资产 checkin 成功时 | Webhook | Slack/Teams/Google Chat | :arrow_down: :computer: Asset Checkin |
 
 ### 事件驱动机制
 
-资产借出/归还通过事件系统触发通知：
+资产借出/归还通过事件系统触发通知，**邮件和 Webhook 是两条独立链路**：
 
 1. **资产借出**: `Asset::checkOut()` → `event(new CheckoutableCheckedOut(...))`
    - **文件**: `app/Models/Asset.php:565`
@@ -169,9 +314,12 @@
 
 3. **通知发送**: `CheckoutableListener@onCheckedOut`
    - **文件**: `app/Listeners/CheckoutableListener.php:73-165`
-   - 发送邮件给借用人（如果启用了 checkout_email、需要验收或有EULA）
-   - 发送邮件给 admin_cc_email（如果设置了 admin_cc_email）
-   - 发送 Webhook 通知（Slack / Microsoft Teams）
+   - **邮件链路**（94-124行）：使用 `CheckoutAssetMail` (Mailable)
+     - 发送给借用人：需要验收 或 有EULA 或 checkin_email 启用
+     - 抄送给 admin_cc_email：有 acceptance 或 admin_cc_always 启用
+   - **Webhook 链路**（127-164行）：使用 `CheckoutAssetNotification` (Notification)
+     - 发送到 Slack / Microsoft Teams / Google Chat
+     - `CheckoutAssetNotification::via()` 只返回 webhook 渠道，**不含 'mail'**
 
 ### 申请通知的特殊逻辑
 **文件**: `app/Actions/CheckoutRequests/CreateCheckoutRequestAction.php:47-50`
@@ -180,6 +328,13 @@
 ```php
 $settings->notify((new RequestAssetNotification($data))->locale($settings->locale));
 ```
+
+### 申请取消的两条路径
+
+| 路径 | 调用代码 | 计数器 | 权限检查 | 通知条件 |
+|------|---------|--------|---------|---------|
+| **审批页 Cancel 按钮** | `ViewAssetsController@getRequestItem` | ❌ 不处理 | ❌ 无 | ✅ 三重条件检查 |
+| **API 取消** | `CancelCheckoutRequestAction::run()` | ✅ 递减 | ✅ 公司权限 | ❌ 无条件 |
 
 ---
 
@@ -317,32 +472,41 @@ AssetCheckoutController@store
     │
     └─ CheckoutableListener@onCheckedOut
         │
-        ├─ 是否发送给用户？
-        │   ├─ 非批量 checkout
-        │   ├─ 资产 requireAcceptance() 或有 EULA 或 checkin_email 启用
-        │   └─ 收件人：借用人 (User)
+        ├─ 🔗 邮件链路（使用 Mailable）
+        │   ├─ 是否发送给用户？
+        │   │   ├─ 非批量 checkout
+        │   │   ├─ 资产 requireAcceptance() 或有 EULA 或 checkin_email 启用
+        │   │   └─ 收件人：借用人 (User) → Mail::to()
+        │   │
+        │   ├─ 是否发送给管理员？
+        │   │   ├─ 非批量 checkout
+        │   │   ├─ 有 acceptance 或 admin_cc_always 启用
+        │   │   ├─ admin_cc_email 已设置
+        │   │   └─ 收件人：admin_cc_email → Mail::cc()
+        │   │
+        │   └─ 使用类：CheckoutAssetMail (Mailable)
         │
-        ├─ 是否发送给管理员？
-        │   ├─ 非批量 checkout
-        │   ├─ 有 acceptance 或 admin_cc_always 启用
-        │   ├─ admin_cc_email 已设置
-        │   └─ 收件人：admin_cc_email (抄送)
-        │
-        └─ 通知类：CheckoutAssetNotification
+        └─ 🔗 Webhook 链路（使用 Notification）
+            ├─ webhook_endpoint 已配置
+            ├─ 使用类：CheckoutAssetNotification (Notification)
+            └─ 渠道：Slack / Microsoft Teams / Google Chat
 ```
 
 **代码位置**: `app/Listeners/CheckoutableListener.php:73-165`
 
 ### 5.4 通知发送条件汇总表
 
-| 通知类型 | 触发条件 | 收件人来源 | 检查的设置项 |
-|---------|---------|-----------|-------------|
-| **申请通知** | 用户提交申请 | `config('mail.reply_to.address')` | `alert_email != '' && alerts_enabled == '1'` |
-| **取消通知** | 申请被取消 | `config('mail.reply_to.address')` | `alert_email != '' && alerts_enabled == '1'` |
-| **借出通知（用户）** | 资产 checkout 成功 | 借用人的 email | `requireAcceptance() 有 EULA checkin_email 启用` |
-| **借出通知（管理员）** | 资产 checkout 成功 | `admin_cc_email` | `admin_cc_email 已设置 (有 acceptance 或 admin_cc_always)` |
-| **归还通知（用户）** | 资产 checkin 成功 | 借用人的 email | `checkin_email 启用` |
-| **归还通知（管理员）** | 资产 checkin 成功 | `admin_cc_email` | `admin_cc_email 已设置` |
+| 通知类型 | 类名 | 类型 | 触发条件 | 收件人来源 | 检查的设置项 |
+|---------|------|------|---------|-----------|-------------|
+| **申请通知** | `RequestAssetNotification` | Notification | 用户提交申请 | `config('mail.reply_to.address')` | `alert_email != '' && alerts_enabled == '1'` |
+| **取消通知（审批页）** | `RequestAssetCancelation` | Notification | 申请被取消（审批页） | `config('mail.reply_to.address')` | `alert_email != '' && alerts_enabled == '1' && !lock_passwords` |
+| **取消通知（API）** | `RequestAssetCancelation` | Notification | 申请被取消（API） | `config('mail.reply_to.address')` | 无条件（try-catch） |
+| **借出邮件（用户）** | `CheckoutAssetMail` | Mailable | 资产 checkout 成功 | 借用人的 email | `requireAcceptance() 有 EULA checkin_email 启用` |
+| **借出邮件（管理员）** | `CheckoutAssetMail` | Mailable | 资产 checkout 成功 | `admin_cc_email` | `admin_cc_email 已设置 (有 acceptance 或 admin_cc_always)` |
+| **借出 Webhook** | `CheckoutAssetNotification` | Notification | 资产 checkout 成功 | webhook_endpoint | `webhook_endpoint 已配置` |
+| **归还邮件（用户）** | `CheckinAssetMail` | Mailable | 资产 checkin 成功 | 借用人的 email | `checkin_email 启用` |
+| **归还邮件（管理员）** | `CheckinAssetMail` | Mailable | 资产 checkin 成功 | `admin_cc_email` | `admin_cc_email 已设置` |
+| **归还 Webhook** | `CheckinAssetNotification` | Notification | 资产 checkin 成功 | webhook_endpoint | `webhook_endpoint 已配置` |
 
 ---
 
@@ -484,18 +648,21 @@ public function availableForCheckout()
           ▼                   ▼                   ▼
 ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
 │  取消申请        │  │  资产借出        │  │  分支选择        │
-│  CancelCheckout- │  │  AssetCheckout-  │  │  2a: Checkin     │
-│  RequestAction   │  │  Controller@store│  │  2b: Cancel      │
+│  getRequestItem  │  │  AssetCheckout-  │  │  2a: Checkin     │
+│  (内部逻辑)      │  │  Controller@store│  │  2b: Cancel      │
 └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
          │                     │                     │
          ├─ 设置 canceled_at   ├─ 前置检查          ├─ 2a: 先归还资产
-         ├─ 递减 requests_counter ├─ availableForCheckout() ├─ 2b: 直接取消
+         ├─ ❌ 不处理计数器    ├─ availableForCheckout() ├─ 2b: 直接取消
          ├─ 记录 'request canceled' ├─ 设置 assigned_to └───────────┬───────────┘
          └─ 发送 RequestAssetCancelation ├─ 触发 CheckoutableCheckedOut 事件
                                │                     │
-                               ├─ 发送 CheckoutAssetNotification
-                               │   ├─ 用户：借用人
-                               │   └─ 管理员：admin_cc_email
+                               ├─ 🔗 邮件链路：CheckoutAssetMail
+                               │   ├─ Mail::to() → 借用人
+                               │   └─ Mail::cc() → admin_cc_email
+                               │
+                               ├─ 🔗 Webhook 链路：CheckoutAssetNotification
+                               │   └─ Slack / Teams / Google Chat
                                │
                                └─ 状态：资产已分配
                                     checkout_request 仍为待处理状态
@@ -525,10 +692,15 @@ public function availableForCheckout()
 | CheckoutAcceptance 邮件路由 | `app/Models/CheckoutAcceptance.php` | 31-39 |
 | 申请通知 | `app/Notifications/RequestAssetNotification.php` | 13-127 |
 | 取消通知 | `app/Notifications/RequestAssetCancelation.php` | 14-133 |
-| 审批页视图 | `resources/views/hardware/requested.blade.php` | 107-115 |
+| **借出邮件 (Mailable)** | `app/Mail/CheckoutAssetMail.php` | 17-179 |
+| **归还邮件 (Mailable)** | `app/Mail/CheckinAssetMail.php` | - |
+| **借出 Webhook (Notification)** | `app/Notifications/CheckoutAssetNotification.php` | 24-176 |
+| **归还 Webhook (Notification)** | `app/Notifications/CheckinAssetNotification.php` | - |
+| 审批页视图 | `resources/views/hardware/requested.blade.php` | 93-115 |
 | 清理命令 | `app/Console/Commands/CleanOldCheckoutRequests.php` | 8-77 |
 | 可申请范围 | `app/Models/Asset.php` | 1788-1803 |
 | 邮件配置 | `config/mail.php` | 237-256 |
+| 路由定义 | `routes/web.php` | 412-413 |
 
 ---
 
@@ -564,7 +736,32 @@ if ($event->checkoutable instanceof Asset) {
 }
 ```
 
-### 问题 3：三个申请入口逻辑不统一
+### 问题 3：两条取消路径逻辑不一致（⚠️ 高风险）
+
+审批页 Cancel 按钮与 API 取消使用完全不同的实现，存在数据不一致风险：
+
+| 对比项 | 审批页 Cancel | API CancelAction |
+|--------|-------------|-----------------|
+| `requests_counter` | ❌ 不处理 | ✅ 递减 |
+| 权限检查 | ❌ 无公司权限检查 | ✅ 有 |
+| 通知条件 | ✅ 三重检查 | ❌ 无条件 |
+| 通知 locale | ✅ 设置 | ❌ 未设置 |
+| 支持类型 | ✅ Asset + AssetModel | ❌ 仅 Asset |
+
+**风险**：审批页取消申请后，`requests_counter` 不会递减，导致计数器数据不一致。
+
+**建议**: 审批页取消操作也调用 `CancelCheckoutRequestAction::run()`，统一逻辑。
+
+### 问题 4：checkout/checkin 邮件与 Webhook 类命名易混淆
+
+- `CheckoutAssetMail` (Mailable) - 用于邮件发送
+- `CheckoutAssetNotification` (Notification) - 仅用于 Webhook，不含 mail 渠道
+
+**风险**: 开发者容易误以为 `CheckoutAssetNotification` 会发送邮件，但实际上它的 `via()` 方法只返回 webhook 渠道。
+
+**建议**: 重命名 `CheckoutAssetNotification` 为 `CheckoutAssetWebhookNotification`，明确其用途。
+
+### 问题 5：三个申请入口逻辑不统一
 
 - `/request/{itemType}/{itemId}` 入口没有权限检查
 - 通用入口不处理 `requests_counter`
@@ -572,18 +769,18 @@ if ($event->checkoutable instanceof Asset) {
 
 **建议**: 统一使用 `CreateCheckoutRequestAction` 和 `CancelCheckoutRequestAction`，消除重复代码。
 
-### 问题 4：fulfilled_at 字段未使用
+### 问题 6：fulfilled_at 字段未使用
 
 数据库中有 `fulfilled_at` 字段但代码中从未使用，可能是遗留功能或未完成功能。
 
-### 问题 5：审批状态不明确
+### 问题 7：审批状态不明确
 
 系统没有明确的"已批准"、"已拒绝"状态，只有"已取消"和"待处理"。借出操作与审批操作耦合在一起，不利于审计追踪。
 
-### 问题 6：alert_email 与 admin_cc_email 职责混淆
+### 问题 8：alert_email 与 admin_cc_email 职责混淆
 
-- `alert_email` 用于申请/取消通知的收件人
-- `admin_cc_email` 用于借出/归还通知的抄送收件人
+- `alert_email` 用于申请/取消通知的**判断条件**（但实际发送到 `reply_to`）
+- `admin_cc_email` 用于借出/归还通知的**抄送收件人**
 - 两个设置项功能相似但使用场景不同，容易造成混淆
 
 **建议**: 考虑合并这两个设置项，或在界面上明确说明它们的区别。
