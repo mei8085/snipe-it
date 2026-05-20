@@ -244,26 +244,28 @@ if ($shouldSendWebhookNotification) {
 审批页面提供两个操作：
 
 1. **取消申请** (Cancel)
-   - 表单提交到 `POST /request/{itemType}/{itemId}/true/{requestingUser}`
-   - 调用 `CancelCheckoutRequestAction`
+   - 表单提交到路由 `account/request-item` → `POST /request/{itemType}/{itemId}/true/{requestingUser}`
+   - 调用 `ViewAssetsController@getRequestItem` 内部逻辑（不使用 Action 类）
    - 记录日志 'request canceled'
-   - 递减 requests_counter
-   - 发送取消通知邮件
+   - ❌ **不处理** requests_counter（存在数据不一致风险）
+   - 发送取消通知邮件（需满足三重条件检查）
 
 2. **借出资产** (Checkout) - **即审批通过**
    - 链接跳转到 `GET /hardware/{asset}/checkout`
    - 由管理员执行 checkout 操作完成审批
    - 如果资产已被占用 (`assigned_to != ''`)，按钮变为 "Checkin"
 
-### 取消申请动作
+### API 取消申请动作（CancelCheckoutRequestAction）
 **文件**: `app/Actions/CheckoutRequests/CancelCheckoutRequestAction.php:13-47`
+
+> ⚠️ 此为 API 取消路径，**审批页 Cancel 按钮不使用此 Action**。
 
 ```
 1. 权限检查（公司权限）
 2. 取消申请 ($asset->cancelRequest() → 设置 canceled_at)
 3. 递减 requests_counter
 4. 记录操作日志 (Actionlog: 'request canceled')
-5. 发送取消通知邮件 (RequestAssetCancelation)
+5. 发送取消通知邮件 (RequestAssetCancelation) - 无条件（try-catch包裹）
 ```
 
 ### Checkout 审批流程
@@ -541,11 +543,14 @@ AssetCheckoutController@store
     │   │
     │   ├─ 分支 1a：点击 "Checkout"（审批通过）
     │   │   └─ 跳转到 /hardware/{asset}/checkout
-    │   │       └─ 执行 checkout 流程 → 发送 CheckoutAssetNotification
+    │   │       └─ 执行 checkout 流程
+    │   │           ├─ 🔗 邮件链路：CheckoutAssetMail
+    │   │           └─ 🔗 Webhook 链路：CheckoutAssetNotification
     │   │
     │   └─ 分支 1b：点击 "Cancel"（审批拒绝）
     │       └─ 提交到 /request/{itemType}/{itemId}/true/{requestingUser}
-    │           └─ 执行 CancelCheckoutRequestAction → 发送 RequestAssetCancelation
+    │           └─ 执行 ViewAssetsController@getRequestItem（内部逻辑）
+    │               └─ 发送 RequestAssetCancelation
     │
     └─ 情况 2：资产已被占用 (assigned_to != '')
         │
@@ -553,13 +558,15 @@ AssetCheckoutController@store
         │   ├─ 跳转到 /hardware/{asset}/checkin
         │   ├─ 执行 checkin 流程
         │   │   ├─ 触发 CheckoutableCheckedIn 事件
-        │   │   └─ 发送 CheckinAssetNotification
+        │   │   ├─ 🔗 邮件链路：CheckinAssetMail
+        │   │   └─ 🔗 Webhook 链路：CheckinAssetNotification
         │   └─ 归还后资产变为可用状态
         │       └─ 管理员需再次进入审批列表，点击 "Checkout"
         │
         └─ 分支 2b：点击 "Cancel"（直接取消申请）
             └─ 提交到 /request/{itemType}/{itemId}/true/{requestingUser}
-                └─ 执行 CancelCheckoutRequestAction → 发送 RequestAssetCancelation
+                └─ 执行 ViewAssetsController@getRequestItem（内部逻辑）
+                    └─ 发送 RequestAssetCancelation
 ```
 
 ### 6.3 借出前的前置保护
@@ -784,3 +791,92 @@ if ($event->checkoutable instanceof Asset) {
 - 两个设置项功能相似但使用场景不同，容易造成混淆
 
 **建议**: 考虑合并这两个设置项，或在界面上明确说明它们的区别。
+
+---
+
+## 十、一致性核对清单
+
+本清单列出所有已修正的冲突点，确保全文同一事实只保留一种说法。
+
+---
+
+### 冲突点 1：审批页 Cancel 按钮调用链
+
+| 项目 | 内容 |
+|------|------|
+| **更正前** | 审批页 Cancel 按钮调用 `CancelCheckoutRequestAction` 并递减 `requests_counter` |
+| **更正后** | 审批页 Cancel 按钮走 `ViewAssetsController@getRequestItem` 内部逻辑，不使用 Action 类，**不处理** `requests_counter` |
+| **代码证据** | `resources/views/hardware/requested.blade.php:93-105` → `route('account/request-item')` → `ViewAssetsController::getRequestItem()` `app/Http/Controllers/ViewAssetsController.php:202-211`（无 `decrement` 调用） |
+| **文档位置** | 第三章"审批操作"小节（第246-251行）、第六章"回退分支"（第548-550、564-567行） |
+
+---
+
+### 冲突点 2：回退分支图 Cancel 分支链路
+
+| 项目 | 内容 |
+|------|------|
+| **更正前** | 回退分支图中 Cancel 分支标注为 `执行 CancelCheckoutRequestAction` |
+| **更正后** | 回退分支图中 Cancel 分支标注为 `执行 ViewAssetsController@getRequestItem（内部逻辑）` |
+| **代码证据** | `resources/views/hardware/requested.blade.php:93-105` 表单提交到 `route('account/request-item')` |
+| **文档位置** | 第六章"完整回退分支"（第548-550、564-567行） |
+
+---
+
+### 冲突点 3：Checkout 通知类混写
+
+| 项目 | 内容 |
+|------|------|
+| **更正前** | Checkout 流程描述为"发送 `CheckoutAssetNotification`"，混淆邮件与 Webhook 类 |
+| **更正后** | Checkout 流程为双链路：🔗 邮件链路使用 `CheckoutAssetMail` (Mailable)，🔗 Webhook 链路使用 `CheckoutAssetNotification` (Notification) |
+| **代码证据** | `app/Listeners/CheckoutableListener.php:94-165` <br> 邮件：`getCheckoutMailType()` → `CheckoutAssetMail::class` → `Mail::to()->send()` <br> Webhook：`getCheckoutNotification()` → `CheckoutAssetNotification::class` → `Notification::route()->notify()` <br> `app/Notifications/CheckoutAssetNotification.php:59-80` → `via()` 只返回 webhook 渠道，**不含 'mail'** |
+| **文档位置** | 第六章"完整回退分支"（第544-546行） |
+
+---
+
+### 冲突点 4：Checkin 通知类混写
+
+| 项目 | 内容 |
+|------|------|
+| **更正前** | Checkin 流程描述为"发送 `CheckinAssetNotification`"，混淆邮件与 Webhook 类 |
+| **更正后** | Checkin 流程为双链路：🔗 邮件链路使用 `CheckinAssetMail` (Mailable)，🔗 Webhook 链路使用 `CheckinAssetNotification` (Notification) |
+| **代码证据** | `app/Listeners/CheckoutableListener.php` → `onCheckedIn()` 方法逻辑与 `onCheckedOut()` 对称，同样使用双链路 |
+| **文档位置** | 第六章"完整回退分支"（第556-560行） |
+
+---
+
+### 冲突点 5：取消申请动作小节标题
+
+| 项目 | 内容 |
+|------|------|
+| **更正前** | 小节标题为"取消申请动作"，易误解为所有取消路径 |
+| **更正后** | 小节标题为"API 取消申请动作（CancelCheckoutRequestAction）"，并添加警告说明审批页不使用此 Action |
+| **代码证据** | 审批页取消使用内部逻辑（见冲突点1），只有 API 取消使用 `CancelCheckoutRequestAction` |
+| **文档位置** | 第三章（第258-269行） |
+
+---
+
+### 冲突点 6：审批页 Cancel 按钮路径描述
+
+| 项目 | 内容 |
+|------|------|
+| **更正前** | 审批页 Cancel 按钮路径描述为 `POST /request/{itemType}/{itemId}/true/{requestingUser}`（仅 URL） |
+| **更正后** | 审批页 Cancel 按钮路径描述为 `路由 account/request-item → POST /request/{itemType}/{itemId}/true/{requestingUser}`（包含路由名称） |
+| **代码证据** | `routes/web.php:412-413` → `Route::post('request/...')->name('account/request-item')` |
+| **文档位置** | 第三章"审批操作"小节（第247行） |
+
+---
+
+### 全文统一事实汇总
+
+| 事实 | 统一说法 | 出现章节 |
+|------|---------|---------|
+| 审批页 Cancel 调用链 | `ViewAssetsController@getRequestItem` 内部逻辑，不使用 Action 类 | 第三章、第六章、第七章 |
+| 审批页 Cancel 计数器 | ❌ 不处理 `requests_counter` | 第三章、第五章、第七章 |
+| API 取消调用链 | `CancelCheckoutRequestAction::run()` | 第三章、第五章 |
+| API 取消计数器 | ✅ 递减 `requests_counter` | 第三章、第五章 |
+| Checkout 邮件类 | `CheckoutAssetMail` (Mailable) | 第四章、第五章、第六章、第七章 |
+| Checkout Webhook 类 | `CheckoutAssetNotification` (Notification，不含 mail 渠道) | 第四章、第五章、第六章、第七章 |
+| Checkin 邮件类 | `CheckinAssetMail` (Mailable) | 第四章、第五章、第六章 |
+| Checkin Webhook 类 | `CheckinAssetNotification` (Notification，不含 mail 渠道) | 第四章、第五章、第六章 |
+| 申请/取消通知收件人 | `config('mail.reply_to.address')`（通过 `Setting::routeNotificationForMail()`） | 第五章 |
+| 借出/归还邮件收件人 | 借用人 + `admin_cc_email`（抄送） | 第四章、第五章 |
