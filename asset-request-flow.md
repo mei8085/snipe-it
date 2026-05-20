@@ -392,31 +392,37 @@ $settings->notify((new RequestAssetNotification($data))->locale($settings->local
 
 #### 三个邮箱配置的职责区分
 
-| 配置项 | 用途 | 代码位置 | 通知类型 |
-|--------|------|---------|---------|
+| 配置项 | 实际用途 | 代码位置 | 通知类型 |
+|--------|---------|---------|---------|
 | `MAIL_FROM_ADDR` | 邮件发件人（显示在 "发件人"） | Laravel 框架自动处理 | 所有邮件 |
-| `MAIL_REPLYTO_ADDR` | 邮件回复地址（用户点击 "回复" 时使用） | `Setting::routeNotificationForMail()` → `config('mail.reply_to.address')` | 申请/取消通知 |
-| `settings.alert_email` | 申请/取消事件的**收件人** | `ViewAssetsController@getRequestItem` 判断条件 | 申请/取消通知 |
-| `settings.admin_cc_email` | checkout/checkin 事件的**抄送收件人** | `CheckoutableListener::getFormattedAlertAddresses()` | 借出/归还通知 |
+| `MAIL_REPLYTO_ADDR` | **申请/取消通知的实际收件人地址**（通过 `Setting::routeNotificationForMail()` 返回） | `Setting::routeNotificationForMail()` → `config('mail.reply_to.address')` | 申请/取消通知 |
+| `settings.alert_email` | **申请/取消事件的触发条件**（`$settings->alert_email != ''`） | `ViewAssetsController@getRequestItem` 判断条件 | 申请/取消通知 |
+| `settings.admin_cc_email` | checkout/checkin 事件的抄送收件人 | `CheckoutableListener::getFormattedAlertAddresses()` | 借出/归还通知 |
+
+> ⚠️ **设计不一致**：`mail.reply_to.address` 被用作**收件人地址**，而非标准邮件协议中的"回复地址"。
 
 #### Setting 的通知路由
-**文件**: `app/Models/Setting.php:249-254`
+**文件**: `app/Models/Setting.php:249-254
 
 ```php
 public function routeNotificationForMail(): ?string
 {
     // 返回 reply_to 地址，而非 alert_email
+    // ⚠️ 这里实际用作收件人地址，不是回复地址
     return config('mail.reply_to.address');
 }
 ```
 
-> **⚠️ 重要发现**: `Setting::routeNotificationForMail()` 返回的是 `mail.reply_to.address`，这意味着：
-> - 当调用 `$settings->notify()` 时，邮件会发送到 `reply_to` 配置的地址
-> - 但代码中检查的是 `$settings->alert_email != ''` 作为发送条件
-> - 这可能导致：配置了 `alert_email` 但 `reply_to` 为空时，通知发送失败
+**收件逻辑**：
+1. 调用 `$settings->notify(new RequestAssetNotification(...))` 时
+2. Laravel 调用 `Setting::routeNotificationForMail()` 获取收件人
+3. 返回 `config('mail.reply_to.address')` 作为邮件的 `to` 地址
+4. `$settings->alert_email` 仅用于判断是否发送，不用于确定收件人
+
+**风险**：配置了 `alert_email` 但 `reply_to` 为空时，通知发送失败但条件检查通过。
 
 #### CheckoutAcceptance 的通知路由（对比）
-**文件**: `app/Models/CheckoutAcceptance.php:31-39`
+**文件**: `app/Models/CheckoutAcceptance.php:31-39
 
 ```php
 public function routeNotificationForMail()
@@ -428,7 +434,7 @@ public function routeNotificationForMail()
 }
 ```
 
-> **对比**: `CheckoutAcceptance` 正确地将 `alert_email` 作为收件人，而 `Setting` 模型则返回 `reply_to` 地址。这是一个不一致的设计。
+> **对比**：`CheckoutAcceptance` 正确地将 `alert_email` 作为收件人，而 `Setting` 模型则返回 `reply_to` 地址。这是一个不一致的设计。
 
 ### 5.3 审批阶段的通知路径
 
@@ -866,6 +872,17 @@ if ($event->checkoutable instanceof Asset) {
 
 ---
 
+### 冲突点 7：通知收件逻辑口径不一致
+
+| 项目 | 内容 |
+|------|------|
+| **更正前** | 描述混淆，部分地方称 `alert_email` 为"收件人"，部分地方称 `reply_to` 为"回复地址" |
+| **更正后** | 统一为三点唯一结论：<br>1. 申请/取消通知真实收件人：`config('mail.reply_to.address')`<br>2. `alert_email` 仅为触发条件（`$settings->alert_email != ''`），不是收件地址<br>3. `reply_to` 被误用为收件人地址，而非标准邮件协议的"回复地址" |
+| **代码证据** | `Setting::routeNotificationForMail()` 返回 `config('mail.reply_to.address')` <br> `app/Models/Setting.php:253` <br> 发送条件：`$settings->alert_email != '' && $settings->alerts_enabled == '1'` <br> `app/Http/Controllers/ViewAssetsController.php:207,214` <br> `RequestAssetNotification::via()` 包含 'mail' 渠道 `app/Notifications/RequestAssetNotification.php:62` |
+| **文档位置** | 第五章"收件人决定机制"、"通知条件汇总表"、第十章"全文统一事实汇总" |
+
+---
+
 ### 全文统一事实汇总
 
 | 事实 | 统一说法 | 出现章节 |
@@ -880,3 +897,77 @@ if ($event->checkoutable instanceof Asset) {
 | Checkin Webhook 类 | `CheckinAssetNotification` (Notification，不含 mail 渠道) | 第四章、第五章、第六章 |
 | 申请/取消通知收件人 | `config('mail.reply_to.address')`（通过 `Setting::routeNotificationForMail()`） | 第五章 |
 | 借出/归还邮件收件人 | 借用人 + `admin_cc_email`（抄送） | 第四章、第五章 |
+
+---
+
+## 十一、最终口径
+
+本章节为全文唯一结论，所有描述均已与此处对齐。
+
+### 结论 1：申请/取消通知的真实收件人
+
+**申请/取消通知的真实收件人为 `config('mail.reply_to.address')`（即环境变量 `MAIL_REPLYTO_ADDR`）。**
+
+**调用链路**：
+```php
+$settings->notify(new RequestAssetNotification($data))
+    ↓
+Laravel 调用 $notifiable->routeNotificationForMail()
+    ↓
+Setting::routeNotificationForMail()  // app/Models/Setting.php:249-254
+    ↓
+return config('mail.reply_to.address');  // 作为邮件的 to 地址
+```
+
+**代码证据**：
+- `app/Models/Setting.php:253` → `return config('mail.reply_to.address');`
+- `app/Notifications/RequestAssetNotification.php:62` → `$notifyBy[] = 'mail';`
+
+---
+
+### 结论 2：`alert_email` 的实际角色
+
+**`settings.alert_email` 仅作为通知发送的触发条件判断，**不**用作收件地址。**
+
+**判断逻辑**：
+```php
+if (($settings->alert_email != '') && ($settings->alerts_enabled == '1') && (! config('app.lock_passwords'))) {
+    $settings->notify(...);  // 满足条件才发送
+}
+```
+
+**代码证据**：
+- `app/Http/Controllers/ViewAssetsController.php:207` → `$settings->alert_email != ''`
+- `app/Http/Controllers/ViewAssetsController.php:214` → `$settings->alert_email != ''`
+- `app/Actions/CheckoutRequests/CreateCheckoutRequestAction.php:47` → 无条件发送（try-catch包裹，API路径）
+
+---
+
+### 结论 3：`reply_to` 的实际作用
+
+**`mail.reply_to.address` 被误用为**实际收件人地址**，而非标准邮件协议中的"回复地址"。**
+
+**设计不一致对比**：
+| 模型 | `routeNotificationForMail()` 返回值 | 用途 |
+|------|------------------------------------|------|
+| `Setting` | `config('mail.reply_to.address')` | 申请/取消通知收件人 |
+| `CheckoutAcceptance` | `Setting::getSettings()->alert_email` | 验收通知收件人（正确用法） |
+
+**代码证据**：
+- `app/Models/Setting.php:253` → `return config('mail.reply_to.address');`
+- `app/Models/CheckoutAcceptance.php:35` → `explode(',', Setting::getSettings()->alert_email);`
+
+**风险提示**：当管理员配置了 `alert_email` 但 `MAIL_REPLYTO_ADDR` 为空时，通知发送条件检查通过，但实际发送失败。
+
+---
+
+### 配置项总览
+
+| 配置项 | 实际作用 |
+|--------|---------|
+| `MAIL_FROM_ADDR` | 邮件发件人 |
+| `MAIL_REPLYTO_ADDR` | **申请/取消通知的实际收件人**（误用） |
+| `settings.alert_email` | **申请/取消通知的发送触发条件** |
+| `settings.admin_cc_email` | 借出/归还邮件的抄送收件人 |
+| `settings.alerts_enabled` | 申请/取消通知的总开关 |
+
