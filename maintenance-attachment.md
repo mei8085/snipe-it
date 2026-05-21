@@ -76,20 +76,47 @@ public function store(ImageUploadRequest $request): JsonResponse|array
 > - 附件必须通过专门的上传接口单独提交（见下文 2.1.2）
 > - 两条路径都会触发 `MaintenanceObserver` 的 `creating` / `created` 事件
 
-### 2.1.2 附件单独上传入口（Web + API）
+### 2.1.2 附件上传的四个代码路径
 
-维护单创建完成后，可通过以下两个独立接口上传附件：
+⚠️ **事实纠正**：共有 **4 个代码路径** 会执行"附件落盘 + `uploaded` 日志写入"完整流程，而非之前认为的 2 个。
 
-| 特性 | Web 上传入口 <br>`UploadedFilesController@store` | API 上传入口 <br>`Api/UploadedFilesController@store` |
-|------|-------------------------------------------------|-----------------------------------------------------|
-| 路由 | `POST /files/maintenances/{id}` | `POST /api/v1/files/maintenances/{id}` |
-| 请求类 | `UploadFileRequest` | `UploadFileRequest` |
-| `handleFile` 调用 | ✅ | ✅ |
-| `logUpload` 调用 | ✅ | ✅ |
-| 事务处理 | ❌ 无 | ❌ 无 |
-| 响应格式 | `RedirectResponse` | `JsonResponse` |
+| 路径 | 控制器方法 | 路由 | 触发场景 |
+|------|-----------|------|---------|
+| 1 | `MaintenancesController@store` | `POST /maintenances` | Web 端**创建**维护单时同步上传附件 |
+| 2 | `MaintenancesController@update` | `PUT /maintenances/{id}` | Web 端**更新**维护单时同步上传附件 |
+| 3 | `UploadedFilesController@store` | `POST /maintenances/{id}/files` | Web 端**独立**上传附件 |
+| 4 | `Api/UploadedFilesController@store` | `POST /api/v1/maintenances/{id}/files` | API 端**独立**上传附件 |
 
-这两个接口是唯一会执行**附件落盘 + `uploaded` 日志写入**完整流程的路径。
+> ⚠️ **路由路径纠正**：
+> - 错误：`POST /files/maintenances/{id}`、`POST /api/v1/files/maintenances/{id}`
+> - 正确：`POST /maintenances/{id}/files`、`POST /api/v1/maintenances/{id}/files`
+> 
+> 路由模式为 `/{object_type}/{id}/files`，对象类型在前，ID 在中，`files` 在后。
+
+四个路径的技术特性对比：
+
+| 特性 | Web 创建 <br>`Maintenances@store` | Web 更新 <br>`Maintenances@update` | Web 独立上传 <br>`UploadedFiles@store` | API 独立上传 <br>`Api/UploadedFiles@store` |
+|------|----------------------------------|----------------------------------|----------------------------------------|--------------------------------------------|
+| 请求类 | `ImageUploadRequest` | `ImageUploadRequest` | `UploadFileRequest` | `UploadFileRequest` |
+| 附件前置验证 | `validateUploadedFiles()` ✅ | `validateUploadedFiles()` ✅ | 由 `UploadFileRequest` 规则自动验证 | 由 `UploadFileRequest` 规则自动验证 |
+| `handleFile` 调用 | ✅ | ✅ | ✅ | ✅ |
+| `logUpload` 调用 | ✅ | ✅ | ✅ | ✅ |
+| 事务处理 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 |
+| 响应格式 | `RedirectResponse` | `RedirectResponse` | `RedirectResponse` | `JsonResponse` |
+
+### 2.1.3 API 创建/更新维护单的附件处理缺失
+
+⚠️ **事实纠正**：`Api/MaintenancesController` 的 `store()` 和 `update()` 方法**完全不处理附件上传**，即便请求中携带了 `file` 字段也会被静默丢弃。
+
+**代码对比**：
+
+| Web 控制器（有附件处理） | API 控制器（无附件处理） |
+|-------------------------|-------------------------|
+| ```php<br>// MaintenancesController@store<br>$this->validateUploadedFiles($request);<br>// ... 保存 maintenance ...<br>$this->storeUploadedFiles($request, $maintenance);<br>``` | ```php<br>// Api/MaintenancesController@store<br>// 没有 validateUploadedFiles 调用<br>// 没有 storeUploadedFiles 调用<br>$maintenance->fill($request->all());<br>$maintenance->save();<br>``` |
+
+**API 上传附件的正确姿势**：必须分两步
+1. 调用 `POST /api/v1/maintenances` 创建维护单，获取返回的 `id`
+2. 调用 `POST /api/v1/maintenances/{id}/files` 单独上传附件
 
 ### 2.2 成本字段处理逻辑
 
@@ -392,6 +419,82 @@ if ($log->logUploadDelete($object, $log->filename)) {
 - 下次列表查询时，该文件会被 `NOT IN` 子查询过滤，不再显示
 - 整个过程用户感知不到文件原本就不存在
 
+#### 3.5.6 长期数据不一致的形成机制
+
+当 `handleFile()` 写盘失败但仍返回文件名时，系统会进入一个**"逻辑存在但物理不存在"**的不一致状态，且这种不一致会**长期存在甚至永久累积**。
+
+##### 不一致的三层放大机制
+
+```
+第一层：handleFile 内部缺陷
+   ↓ Storage::put() 失败 → catch 静默吞异常
+   ↓ 函数签名 : string 强制返回字符串
+   ↓ 返回文件名，调用方无法感知失败
+   ↓
+第二层：调用方无条件写日志
+   ↓ logUpload() 写入 action_logs
+   ↓ action_type='uploaded' + filename='xxx.pdf'
+   ↓ 数据库记录 ✅ 存在
+   ↓ 物理文件 ❌ 不存在
+   ↓
+第三层：查询逻辑永不校验物理存在
+   ↓ uploads() 关联只查 action_logs 表
+   ↓ 不联查 Storage::exists()
+   ↓ 列表永远显示该文件
+   ↓ 不一致状态永久保留
+```
+
+##### 不一致的长期累积效应
+
+| 时间点 | 事件 | 数据状态 | 用户感知 |
+|-------|------|---------|---------|
+| T+0 | 上传操作 | `handleFile()` 写盘失败，返回文件名 | 显示"上传成功" ✅ |
+| T+0 | 日志写入 | `logUpload()` 写入 DB，`action_type='uploaded'` | 无感知（后台完成） |
+| T+5 分钟 | 用户下载 | `Storage::exists()` 返回 false | 显示"File not found" ❌ |
+| T+1 天 | 用户再次查看列表 | `uploads()` 查询返回该文件 | 文件仍显示在列表中 ✅ |
+| T+7 天 | 管理员清理磁盘 | 扫描 `private_uploads/maintenances/` | 该文件不在磁盘上，无记录可追溯 |
+| T+30 天 | 备份恢复 | 数据库恢复 + 文件恢复 | 该文件的 DB 记录存在，但磁盘无对应文件 |
+| T+∞ | 不一致永久保留 | 除非用户主动"删除"该文件（写入 `upload deleted` 日志），否则该记录永远存在 | 幽灵文件永久显示在列表中 |
+
+##### 关键缺陷：缺乏校验补偿机制
+
+系统在多个环节都有机会检测并修复不一致，但全部缺失：
+
+| 环节 | 现有行为 | 预期行为 |
+|-----|---------|---------|
+| `handleFile()` 返回值 | 总是返回 `string` | 失败时 `throw` 或返回 `false` |
+| 调用方检查 | 无检查，直接 `logUpload` | 检查返回值，失败时向上抛错 |
+| `uploads()` 查询 | 只查 DB | DB 查询后批量校验 `Storage::exists()`，标记不一致 |
+| 列表展示 | 直接显示 DB 记录 | 对不存在的文件打红叉标记 |
+| 下载接口 | 返回 `File not found` | 返回 `File not found`，同时记录 `error` 级别日志 |
+| 定时任务 | 无 | 定期清理"有日志无文件"的不一致记录 |
+
+##### 不一致记录的识别 SQL
+
+可通过以下 SQL 定位系统中已存在的不一致记录：
+
+```sql
+-- 找出所有 action_type='uploaded' 但磁盘无对应文件的记录
+-- 注：需要结合应用层 Storage::exists() 批量校验，SQL 无法直接读磁盘
+SELECT 
+    al.id,
+    al.item_id,
+    al.filename,
+    al.created_at,
+    al.created_by,
+    CONCAT('private_uploads/maintenances/', al.filename) as expected_path
+FROM action_logs al
+WHERE al.item_type = 'App\\Models\\Maintenance'
+  AND al.action_type = 'uploaded'
+  AND al.filename IS NOT NULL
+  AND al.filename NOT IN (
+      SELECT filename FROM action_logs 
+      WHERE item_type = 'App\\Models\\Maintenance'
+        AND action_type = 'upload deleted'
+  )
+ORDER BY al.created_at DESC;
+```
+
 ---
 
 ## 四、资产状态联动逻辑
@@ -581,7 +684,49 @@ maintenance_types 表
 | Web 更新维护单 + 上传附件 | `MaintenancesController@update` | ✅ 执行 | ✅ 写入 |
 | API 更新维护单 + 上传附件 | `Api/MaintenancesController@update` | ❌ **不执行** | ❌ **不写入** |
 
-> **重要提示**：通过 API 创建/更新维护单时，附件必须单独调用 `/api/v1/files/maintenances/{id}` 接口上传，否则附件会被静默丢弃。
+> ⚠️ **路由纠正 + 重要提示**：
+> - 错误路由：`/api/v1/files/maintenances/{id}`
+> - 正确路由：`POST /maintenances/{id}/files`（Web）、`POST /api/v1/maintenances/{id}/files`（API）
+> - 通过 API 创建/更新维护单时，附件必须单独调用独立上传接口，否则附件会被静默丢弃。
+
+### 7.1 调用方缺乏成功判定机制分析
+
+所有 4 个上传路径都存在相同的设计缺陷——**调用方完全依赖 `handleFile()` 的返回值，但该函数从不返回失败状态**。
+
+**四个调用方的共同模式**：
+```php
+// 模式完全一致，出现在 4 个控制器中
+$file_name = $request->handleFile($storagePath, $prefix.'-'.$id, $file);
+$files[] = $file_name;
+$object->logUpload($file_name, $notes);  // 无条件写入数据库
+```
+
+**调用方代码位置**：
+| 控制器 | 代码行 | 模式 |
+|-------|--------|------|
+| `MaintenancesController@storeUploadedFiles` | 第 215-221 行 | `handleFile` → `logUpload` |
+| `MaintenancesController@update` → `storeUploadedFiles` | 第 183 行 | 间接调用同上 |
+| `UploadedFilesController@store` | 第 54-56 行 | `handleFile` → `logUpload` |
+| `Api/UploadedFilesController@store` | 第 108-110 行 | `handleFile` → `logUpload` |
+
+**缺陷根源**：
+```php
+// UploadFileRequest.php:43-63
+public function handleFile(string $dirname, string $name_prefix, $file): string
+{
+    // ... 省略文件名生成 ...
+    
+    try {
+        Storage::put($dirname.$file_name, $uploaded_file);
+    } catch (\Exception $e) {
+        Log::debug($e);  // 仅 debug 日志，不向上传播
+    }
+    
+    return $file_name;  // ⚠️  总是返回字符串，永远不会返回 false/throw
+}
+```
+
+函数签名 `: string` 从语法层面就**不可能返回失败**，调用方连空值检查都没必要做。
 
 ---
 
@@ -594,9 +739,11 @@ maintenance_types 表
 | 附件上传 | `UploadFileRequest::handleFile()` | `UploadFileRequest.php:43-63` |
 | 附件存储路径 | 基类静态数组配置 | `Controller.php:66-98` |
 | 附件关联 | `action_logs` 表软关联 | `HasUploads.php:9-22` |
-| 上传日志记录 | `Loggable::logUpload()` | `Loggable.php:521-541` |
+| 上传日志记录（4 个路径） | `Loggable::logUpload()` | `Loggable.php:521-541` |
 | Web 创建时附件处理 | `storeUploadedFiles()` 内联方法 | `MaintenancesController.php:195-223` |
+| Web 更新时附件处理 | `update()` → `storeUploadedFiles()` | `MaintenancesController.php:183` |
 | 上传失败静默吞异常 | `try-catch` + `Log::debug()` | `UploadFileRequest.php:56-60` |
+| 调用方无成功校验 | 无条件调用 `logUpload()` | 4 个控制器共 4 处 |
 | 资产状态快照 | `creating` 观察者事件 | `MaintenanceObserver.php:15-23` |
 | 维护完成处理 | `complete()` 方法 + `saveQuietly()` | `MaintenancesController.php:245-270` |
 | 资产状态读取 | 只读关联 `$maintenance->asset->status` | `MaintenancesTransformer.php:43-48` |
@@ -612,35 +759,110 @@ maintenance_types 表
 4. **批量操作支持**：支持一次为多个资产创建相同的维护记录
 5. **Web/API 双轨设计**：Web 入口功能更完整，API 入口更轻量化
 
-### 已知缺陷：上传写盘失败数据不一致
+### 已知缺陷：上传写盘失败导致永久数据不一致
 
-**根本原因**：`UploadFileRequest::handleFile()` 中 `Storage::put()` 异常被静默捕获（仅打 debug 日志），但调用方继续执行 `logUpload()` 写入数据库。
+⚠️ **经过代码事实核查后的完整缺陷分析**：
 
-**风险等级**：中高
+#### 缺陷根源（三重设计错误叠加）
 
-**影响范围**：所有使用 `UploadFileRequest::handleFile()` 的模块（不仅限于维护记录）
+```
+第一重：handleFile() 函数签名缺陷
+    ↓ 返回值声明为 : string，语法上无法返回失败
+    ↓ 内部 try-catch 仅 Log::debug($e)，不向上传播
+    ↓ 无论写盘成功失败，都返回生成的文件名
 
-**修复建议**：
+第二重：所有调用方缺乏成功判定
+    ↓ 4 个调用方完全信任返回值
+    ↓ 无 Storage::exists() 二次校验
+    ↓ 无条件执行 logUpload() 写入数据库
+
+第三重：查询链路永不校验物理存在
+    ↓ $maintenance->uploads() 只查 action_logs 表
+    ↓ 不联查磁盘文件是否真实存在
+    ↓ 不一致记录永久显示在列表中
+```
+
+#### 数据不一致的永久化路径
+
+| 阶段 | 行为 | 结果 |
+|-----|------|------|
+| 上传时 | `Storage::put()` 失败（如磁盘满、S3 断连） | 异常被静默捕获，仅 debug 日志有记录 |
+| 上传后 1 秒 | 调用方 `logUpload()` 写入 DB | DB 记录 ✅ 存在，物理文件 ❌ 不存在 |
+| 用户查看列表 | `uploads()` 查询返回记录 | 文件显示正常 ✅，用户无感知 |
+| 用户点击下载 | `show()` 检查 `Storage::exists()` | 显示"File not found" ❌，HTTP 200 |
+| N 天后 | 文件仍显示在列表中 | 不一致状态永久保留，除非用户主动删除 |
+| 备份恢复 | DB 恢复 + 文件恢复 | 幽灵记录跟随 DB 永久存在 |
+
+#### 影响范围
+- **受影响模块**：所有使用 `handleFile()` 的对象类型（assets, audits, maintenances, models, users, locations, accessories, consumables, licenses, suppliers, components, companies, departments）
+- **受影响接口**：Web/Update 的 4 个上传路径
+- **风险等级**：高（数据不一致 + 用户体验差 + 审计追溯困难）
+
+#### 完整修复建议
+
 ```php
-// 原代码（有缺陷）
-try {
-    Storage::put($dirname.$file_name, $uploaded_file);
-} catch (\Exception $e) {
-    Log::debug($e);  // 级别太低
-}
-return $file_name;
+// 修复方案 1：handleFile() 抛出异常（推荐）
+// UploadFileRequest.php:43-63
+public function handleFile(string $dirname, string $name_prefix, $file): string
+{
+    // ... 文件名生成 ...
 
-// 建议修复方案
-try {
-    Storage::put($dirname.$file_name, $uploaded_file);
-} catch (\Exception $e) {
-    Log::error('File upload failed: '.$e->getMessage(), [
-        'file_name' => $file_name,
-        'dirname' => $dirname,
-    ]);
-    throw $e;  // 抛出异常让调用方处理
+    try {
+        Storage::put($dirname.$file_name, $uploaded_file);
+    } catch (\Exception $e) {
+        // 升级日志级别，保留上下文
+        Log::error('File upload write failed', [
+            'file_name' => $file_name,
+            'original_name' => $file->getClientOriginalName(),
+            'size' => $file->getSize(),
+            'mime' => $file->getMimeType(),
+            'dirname' => $dirname,
+            'error' => $e->getMessage(),
+        ]);
+        // 抛出异常，让调用方决定回滚策略
+        throw new \RuntimeException('Failed to write uploaded file to storage', 0, $e);
+    }
+
+    return $file_name;
 }
-return $file_name;
+
+// 修复方案 2：调用方增加成功校验（补充防御）
+// MaintenancesController.php:215-221
+foreach ((array) $request->file('file') as $file) {
+    if (! $file) continue;
+
+    $fileName = $uploadFileRequest->handleFile($storagePath, $prefix.'-'.$maintenance->id, $file);
+
+    // 增加二次校验：确认文件真的写入了
+    if (! Storage::exists($storagePath.$fileName)) {
+        Log::error('File not found after handleFile return', ['file' => $fileName]);
+        continue;  // 跳过，不写日志
+    }
+
+    $maintenance->logUpload($fileName, $request->input('file_notes'));
+}
+
+// 修复方案 3：上传列表增加批量校验（用户体验优化）
+// HasUploads.php:9-22
+public function uploads()
+{
+    return $this->hasMany(Actionlog::class, 'item_id')
+        ->where('item_type', self::class)
+        ->where('action_type', '=', 'uploaded')
+        ->whereNotNull('filename')
+        ->whereNotIn('filename', function ($query) {
+            $query->select('filename')
+                ->from('action_logs')
+                ->where('item_type', '=', self::class)
+                ->where('action_type', '=', 'upload deleted')
+                ->where('item_id', $this->id);
+        });
+}
+
+// 调用时批量校验物理存在
+// $uploads = $maintenance->uploads->get()->each(function($log) {
+//     $log->file_exists = Storage::exists(self::$map_storage_path['maintenances'].$log->filename);
+// });
 ```
 
 ### 关联不直观的原因
@@ -648,6 +870,7 @@ return $file_name;
 2. **资产状态只读**：维护完成不自动变更资产状态，容易让人误解两者没有关联
 3. **双轨维护类型**：同时存在 `maintenance_type_id`（新）和 `asset_maintenance_type`（旧）两个字段
 4. **快照字段隐藏**：`checked_out_to_id` 和 `checked_out_to_type` 是后台自动填充，用户界面不明显
-5. **Web/API 功能差异**：API 创建维护单不处理附件，容易造成 API 调用方误解
+5. **Web/API 功能差异**：API 创建/更新维护单不处理附件，容易造成 API 调用方误解
 6. **异常静默处理**：上传失败不提示用户，导致用户以为上传成功实际失败
+7. **路由模式特殊**：`/{object_type}/{id}/files` 模式容易被误记为 `/files/{object_type}/{id}`
 
