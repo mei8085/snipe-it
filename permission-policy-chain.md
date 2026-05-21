@@ -592,13 +592,39 @@ Gate::define('import', function ($user) {
 
 **同一个权限检查，从不同入口调用，走的代码路径完全不同**。这是理解系统的核心。
 
-#### ⚠️ 另一个重要修正：`authorize:superuser` vs `authorize:superadmin`
+---
 
-代码中同时存在两种写法，但**实际效果完全相同**：
-- `routes/web.php:155` 用 `authorize:superuser`
-- `routes/scim.php:19` 用 `authorize:superadmin`
+#### ⚠️ 重要修正：`authorize:superuser` vs `authorize:superadmin` 为何效果相同，但原因不是"ability 被忽略"
 
-但两者都**没有**对应的 `Gate::define()`，都依赖 `Gate::before()` 中的 `$user->isSuperUser()` 检查，而 `isSuperUser()` 检查的是 `'superuser'` 权限位。所以不管写 `superuser` 还是 `superadmin`，实际都是检查 `'superuser'` 权限位。这是历史遗留的命名不统一问题。
+代码中同时存在两种写法，效果相同，但之前"ability 参数被忽略"的说法是**错误**的。正确的理解是：
+
+**Gate::before() 对不同 ability 的处理**（`AuthServiceProvider.php:112-122`）：
+```php
+Gate::before(function ($user, $ability) {
+    // 只有 editableOnDemo 做了特殊处理
+    if (($ability == 'editableOnDemo') && (config('app.lock_passwords'))) {
+        return false;
+    }
+    // 对所有其他 ability：superuser 返回 true，非 superuser 返回 null（继续）
+    if ($user->isSuperUser()) {
+        return true;
+    }
+    // 非 superuser 的非 editableOnDemo：返回 null，继续后续检查
+});
+```
+
+**`authorize:superuser` 和 `authorize:superadmin` 效果相同的真正原因**：
+- 两者都**没有**对应的 `Gate::define()`
+- superuser 在 `Gate::before()` 中通过（返回 true）
+- 非 superuser 在 `Gate::before()` 返回 null → 继续查找 `Gate::define()` → 找不到 → 兜底返回 false
+- 所以两者对非 superuser 都被拒绝，效果相同
+
+**但 ability 参数并没有被忽略！** 如果用 `authorize:admin`（虽然代码中没这样用）：
+- 有 `Gate::define('admin')`
+- superuser 在 `Gate::before()` 通过
+- 非 superuser 但有 admin 权限位的用户 → `Gate::define('admin')` 返回 true → **可以通过！
+
+这与 `authorize:superuser` 的效果完全不同。
 
 ---
 
@@ -615,13 +641,16 @@ HTTP Request
     ├─ auth 中间件 → 认证
     └─ authorize 中间件（CheckPermissions.php:21）
             ↓
-            Gate::allows('superuser')
+            Gate::allows($section)  //$section = 'superuser'
                 ↓
                 【只走第1、5、6层】
-                第1层：Gate::before() → 检查 $user->isSuperUser()
-                    ├─ 是 superuser → return true ✅
-                    └─ 否 → return null
-                第5层：查找 Gate::define('superuser') → 未定义
+                第1层：Gate::before()
+                    ├─ $ability == 'editableOnDemo' 且 演示模式 → return false ❌
+                    ├─ $user->isSuperUser() → return true ✅
+                    └─ 其他 → return null（继续）
+                第5层：查找 Gate::define($section)
+                    ├─ 有 define → 执行闭包 → 返回 true/false
+                    └─ 无 define → 继续
                 第6层：兜底 → return false ❌
                 （不会走到任何 Policy！因为没有传模型参数）
             ↓
@@ -637,21 +666,31 @@ Route::group(['prefix' => 'admin', 'middleware' => ['auth', 'authorize:superuser
 });
 ```
 
-**中间件调用的三种真实场景对比**：
+---
 
-| 中间件写法 | 调用 | 实际走的层级 | 检查内容 |
-|-----------|------|-------------|---------|
-| `authorize:superuser` | `Gate::allows('superuser')` | 第1→5→6层 | `Gate::before()` 中 `isSuperUser()` |
-| `authorize:superadmin` | `Gate::allows('superadmin')` | 第1→5→6层 | 同上（因为 `Gate::before()` 不关心 ability 是什么，只检查 `isSuperUser()`） |
-| `authorize:admin` | `Gate::allows('admin')` | 第1→5→6层 | `Gate::before()` 检查 superuser，然后 `Gate::define('admin')` 检查 admin 权限位 |
-| `authorize:import` | `Gate::allows('import')` | 第1→5→6层 | `Gate::before()` 检查 superuser，然后 `Gate::define('import')` 检查 import 权限位 |
+### 🔥 中间件传入不同 ability 的完整行为矩阵
 
-**关键发现**：对于 `authorize:superuser` 和 `authorize:superadmin`，**ability 参数完全被忽略**，因为在 `Gate::before()` 中只调用 `$user->isSuperUser()`，不检查 `$ability` 的值（除了 `editableOnDemo` 特殊情况）。
+| 中间件写法 | Gate::define 存在？ | superuser | 非 superuser 有权限位 | 最终效果 |
+|-----------|-----------------|----------|---------------------|---------|
+| `authorize:superuser` | ❌ 无 | ✅ 通过 | ❌ 拒绝（无 define） | 只有 superuser 通过 |
+| `authorize:superadmin` | ❌ 无 | ✅ 通过 | ❌ 拒绝（无 define） | 只有 superuser 通过 |
+| `authorize:admin` | ✅ 有 | ✅ 通过 | 有 `admin` 权限位 → ✅ 通过 | superuser + admin 用户通过 |
+| `authorize:import` | ✅ 有 | ✅ 通过 | 有 `import` 权限位 → ✅ 通过 | superuser + import 用户通过 |
+| `authorize:reports.view` | ✅ 有 | ✅ 通过 | 有 `reports.view` 权限位 → ✅ 通过 | superuser + reports 用户通过 |
+| `authorize:任意未定义字符串` | ❌ 无 | ✅ 通过 | ❌ 拒绝（无 define） | 只有 superuser 通过 |
+
+**关键结论**：ability 参数**没有**被忽略，它决定了非 superuser 是否能通过。`superuser` 和 `superadmin` 效果相同，是因为两者都没有对应的 `Gate::define()`，而非 ability 被忽略。
+
+---
+
+**代码中实际使用的中间件只有两种**（都属于"无 define"类）：
+- `authorize:superuser`（web.php, api.php）
+- `authorize:superadmin`（scim.php）
 
 **特点**：
 - ✅ 粗粒度过滤，适合整个路由组
 - ❌ 不传模型实例，**不会触发 Policy 层**，更不会触发公司范围检查
-- ❌ admin 角色的放行逻辑在 `Policy::before()` 中，所以中间件检查 `authorize:admin` 时**不会放行 admin 角色**（因为走不到 Policy 层）
+- ❌ 对于"有 define"类中间件（如 `authorize:admin`），非 superuser 但有对应权限位的用户可以通过
 - ⚠️ 在控制器方法执行**之前**就触发
 
 #### 路径B：控制器内 `$this->authorize()`
