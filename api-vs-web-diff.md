@@ -545,25 +545,116 @@ polymorphicItemFormatter(value)  [第1752行]
 ],
 ```
 
-**场景 C：配件检出 assigned_to 字段 - 数据丢失**
+**场景 C：配件检出 assigned_to 字段 - 格式不兼容 + 部分缺失**
 
-配件检出使用不同的 Transformer 方法链，同样缺失 `deleted_at`:
+配件检出使用不同的 Transformer 方法链，按分配类型拆分后结果不同，且存在**格式不兼容**问题:
 ```php
 // AccessoriesTransformer.php:117-129
 public function transformAssignedTo($accessoryCheckout)
 {
     if ($accessoryCheckout->checkedOutToUser()) {
         return (new UsersTransformer)->transformUserCompact($accessoryCheckout->assigned);
-        // ❌ transformUserCompact 不输出 deleted_at
+        // ⚠️ transformUserCompact 输出了 deleted_at，但格式是对象（非原始值）
     } elseif ($accessoryCheckout->checkedOutToLocation()) {
         return (new LocationsTransformer)->transformLocationCompact($accessoryCheckout->assigned);
-        // ❌ transformLocationCompact 不输出 deleted_at
+        // ❌ transformLocationCompact 不输出 deleted_at（LocationsTransformer.php:150-168）
     } elseif ($accessoryCheckout->checkedOutToAsset()) {
         return (new AssetsTransformer)->transformAssetCompact($accessoryCheckout->assigned);
-        // ❌ transformAssetCompact 不输出 deleted_at
+        // ❌ transformAssetCompact 不输出 deleted_at（AssetsTransformer.php:296-310）
     }
 }
 ```
+
+**三个 Compact 方法的实际实现对比**:
+
+```php
+// UsersTransformer.php:135-156 - ⚠️ 有 deleted_at 但格式不兼容
+public function transformUserCompact(User $user): array
+{
+    $array = [
+        'id' => (int) $user->id,
+        'image' => e($user->present()->gravatar) ?? null,
+        'type' => 'user',
+        'name' => e($user->display_name),
+        'first_name' => e($user->first_name),
+        'last_name' => e($user->last_name),
+        'username' => e($user->username),
+        'display_name' => e($user->display_name),
+        'created_by' => $user->adminuser ? [
+            'id' => (int) $user->adminuser->id,
+            'name' => e($user->adminuser->present()->fullName),
+        ] : null,
+        'created_at' => Helper::getFormattedDateObject($user->created_at, 'datetime'),
+        'deleted_at' => ($user->deleted_at) ? Helper::getFormattedDateObject($user->deleted_at, 'datetime') : null,
+        // ⚠️ 第152行：输出了 deleted_at，但通过 getFormattedDateObject() 返回对象格式
+        // 返回值示例：{ datetime: "2024-01-01 12:00:00", formatted: "2024-01-01 12:00 PM" }
+    ];
+    return $array;
+}
+
+// LocationsTransformer.php:150-168 - ❌ 无 deleted_at
+public function transformLocationCompact(?Location $location = null)
+{
+    if ($location) {
+        $array = [
+            'id' => (int) $location->id,
+            'image' => ($location->image) ? Storage::disk('public')->url('locations/'.e($location->image)) : null,
+            'type' => 'location',
+            'name' => e($location->name),
+            'created_by' => $location->adminuser ? [...] : null,
+            'created_at' => Helper::getFormattedDateObject($location->created_at, 'datetime'),
+            // ❌ 没有 deleted_at
+        ];
+        return $array;
+    }
+}
+
+// AssetsTransformer.php:296-310 - ❌ 无 deleted_at
+public function transformAssetCompact(Asset $asset)
+{
+    $array = [
+        'id' => (int) $asset->id,
+        'image' => ($asset->getImageUrl()) ? $asset->getImageUrl() : null,
+        'type' => 'asset',
+        'name' => e($asset->display_name),
+        'model' => ($asset->model) ? e($asset->model->name) : null,
+        'model_number' => (($asset->model) && ($asset->model->model_number)) ? e($asset->model->model_number) : null,
+        'asset_tag' => e($asset->asset_tag),
+        'serial' => e($asset->serial),
+        // ❌ 没有 deleted_at
+    ];
+    return $array;
+}
+```
+
+**关键问题：deleted_at 格式不兼容**
+
+Formatter 期望的是**原始 datetime 字符串**，但 `transformUserCompact()` 输出的是**对象格式**：
+
+| 输出方式 | deleted_at 格式 | Formatter 检查 `value.deleted_at != ''` |
+|---------|----------------|----------------------------------------|
+| 组件检出（直接输出） | `"2024-01-01 12:00:00"` 字符串 | ✅ 正常工作 |
+| transformUserCompact | `{ datetime: "...", formatted: "..." }` 对象 | ⚠️ 格式不兼容 |
+
+**JavaScript 比较行为分析**：
+```javascript
+// 组件检出场景 - 正常
+value.deleted_at = "2024-01-01 12:00:00";
+value.deleted_at != ''  // true → ✅ 触发删除线
+
+// transformUserCompact 场景 - 格式不兼容
+value.deleted_at = { datetime: "2024-01-01 12:00:00", formatted: "..." };
+value.deleted_at != ''  // 对象转字符串后是 "[object Object]" != "" → true
+// ⚠️ 虽然条件能通过，但这是依赖 JavaScript 隐式类型转换的巧合，不是设计意图！
+// 正确的设计应该统一输出格式。
+```
+
+**配件检出场景的实际表现**:
+| 分配给 | Transformer 方法 | 是否输出 deleted_at | 输出格式 | 格式化器能否显示删除线 |
+|--------|-----------------|---------------------|---------|------------------------|
+| **用户** | `transformUserCompact()` | ⚠️ 是（但格式错） | 对象格式 | ⚠️ 巧合可用但格式不统一 |
+| **位置** | `transformLocationCompact()` | ❌ 否 | - | ❌ 不能 |
+| **资产** | `transformAssetCompact()` | ❌ 否 | - | ❌ 不能 |
 
 #### 4.4.3 Formatter 层的检查逻辑
 
@@ -1060,6 +1151,17 @@ Bootstrap Table 解析响应:
 
 6. **`available_actions` 冗余写法**: 每个条件都有多余的 `? true : false`，代码不够简洁。
 
+7. **`AssetsTransformer::transformAssignedTo()` 缺失 `deleted_at` 输出**: 模型关系层使用 `withTrashed()` 能获取到分配目标的 `deleted_at`，但 `AssetsTransformer::transformAssignedTo()` 未将其输出（用户类型和其他类型都缺失），导致 `polymorphicItemFormatter` 的删除线逻辑在资产列表场景下完全失效。这是一个功能 BUG，用户无法直观识别已被软删除的分配目标。
+
+8. **跨场景实现不一致**: 同样是多态关联对象的输出，各方法的 `deleted_at` 输出情况不一致：
+   - `transformCheckedoutComponents()` → ✅ 正确输出
+   - `transformUserCompact()` → ✅ 正确输出
+   - `AssetsTransformer::transformAssignedTo()` → ❌ 缺失
+   - `transformLocationCompact()` → ❌ 缺失
+   - `transformAssetCompact()` → ❌ 缺失
+
+   代码一致性差，同一套格式化器在不同场景下表现不同。
+
 ### 11.3 优化建议
 
 1. **显式设置所有列的 `visible` 属性**: 避免依赖框架默认值，提高代码可读性。
@@ -1073,3 +1175,14 @@ Bootstrap Table 解析响应:
 5. **关联排序优化**: 考虑使用子查询或预先计算的排序列优化关联字段排序性能。
 
 6. **清理 `available_actions` 代码**: 移除多余的 `? true : false` 写法。
+
+7. **【BUG 修复】补充 `transformAssignedTo()` 的 `deleted_at` 输出**:
+   ```php
+   // 在用户类型输出中添加
+   'deleted_at' => $asset->assigned->deleted_at,
+   
+   // 在其他类型输出中添加
+   'deleted_at' => $asset->assigned->deleted_at,
+   ```
+
+8. **统一多态关联输出规范**: 所有多态关联对象的 Transformer 方法都应包含 `deleted_at` 字段，确保格式化器的删除线逻辑在所有场景下都能正常工作。同时考虑提取公共的 `transformPolymorphicItem()` 方法，避免代码重复。
