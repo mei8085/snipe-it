@@ -442,9 +442,159 @@ function polymorphicItemFormatter(value) {
 | `email` | ❌ 否 | 完全不使用 |
 | `employee_number` | ❌ 否 | 完全不使用 |
 | `jobtitle` | ❌ 否 | 完全不使用 |
-| `deleted_at` | ✅ 是（Transformer 不输出） | 但 Formatter 有检查逻辑（实际 API 不输出此字段） |
+| `deleted_at` | ⚠️ 部分使用 | Formatter 有检查逻辑，但资产列表场景下 Transformer 不输出此字段 |
 
-> **重要发现**：Transformer 为用户类型输出了 8 个字段，但 Formatter 只使用了 `id`、`type`、`name`、`username` 这 4 个字段，其余 4 个字段（`first_name`、`last_name`、`email`、`employee_number`、`jobtitle`）在网页表格中完全浪费。
+> **重要发现**：Transformer 为用户类型输出了 9 个字段，但 Formatter 只使用了 `id`、`type`、`name`、`username` 这 4 个字段，其余 5 个字段（`first_name`、`last_name`、`email`、`employee_number`、`jobtitle`）在网页表格中完全浪费。
+
+### 4.4 deleted_at 在 assigned_to 渲染链路中的完整处理逻辑
+
+#### 4.4.1 deleted_at 的携带位置
+
+**模型关系层** - `deleted_at` 的获取 (`app/Models/Asset.php:734-736`):
+```php
+public function assignedTo()
+{
+    // 【关键】使用 withTrashed()，关联对象包含 deleted_at 属性
+    return $this->morphTo('assigned', 'assigned_type', 'assigned_to')->withTrashed();
+}
+```
+
+**重要说明**:
+- `deleted_at` 是**分配目标对象**（用户/位置/资产等）的属性，不是当前资产的属性
+- `->withTrashed()` 确保即使分配目标已被软删除，也能查询到关联对象
+- 原始 Eloquent 模型对象 `$asset->assigned` 确实包含 `deleted_at` 属性
+
+#### 4.4.2 deleted_at 在哪一步进入（或未进入）Formatter
+
+**场景 A：资产列表 assigned_to 字段 - 数据丢失**
+
+```
+资产模型 assignedTo() 关系
+    ↓ withTrashed() → 关联对象包含 deleted_at 属性
+    ↓
+AssetsTransformer@transformAssignedTo()  [第215-236行]
+    ↓ ❌ 【BUG 点】没有提取 deleted_at 到输出数组
+    ↓ 无论是用户类型还是其他类型，都没有输出 deleted_at
+    ↓
+API 响应 assigned_to 字段（无 deleted_at）
+    ↓
+Bootstrap Table 接收数据
+    ↓
+polymorphicItemFormatter(value)  [第1752行]
+    ↓ value.deleted_at 是 undefined
+    ↓ ❌ 删除线逻辑永远不触发
+    ↓
+正常显示（没有删除线）
+```
+
+**Transformer 代码事实** (`app/Http/Transformers/AssetsTransformer.php:215-236`):
+```php
+public function transformAssignedTo($asset)
+{
+    if ($asset->checkedOutToUser()) {
+        return $asset->assigned ? [
+            'id' => (int) $asset->assigned->id,
+            'username' => e($asset->assigned->username),
+            'name' => e($asset->assigned->display_name),
+            'first_name' => e($asset->assigned->first_name),
+            'last_name' => ($asset->assigned->last_name) ? e($asset->assigned->last_name) : null,
+            'email' => ($asset->assigned->email) ? e($asset->assigned->email) : null,
+            'employee_number' => ($asset->assigned->employee_num) ? e($asset->assigned->employee_num) : null,
+            'jobtitle' => $asset->assigned->jobtitle ? e($asset->assigned->jobtitle) : null,
+            'type' => 'user',
+            // ❌ 缺失：没有 'deleted_at' 字段
+        ] : null;
+    }
+
+    return $asset->assigned ? [
+        'id' => $asset->assigned->id,
+        'name' => e($asset->assigned->display_name),
+        'type' => $asset->assignedType(),
+        // ❌ 缺失：没有 'deleted_at' 字段
+    ] : null;
+}
+```
+
+**场景 B：组件检出列表 name 字段 - 数据完整**
+
+```
+ComponentCheckout 模型 component 关系
+    ↓ withTrashed() → 组件对象包含 deleted_at 属性
+    ↓
+AssetsTransformer@transformCheckedoutComponents()  [第405-409行]
+    ↓ ✅ 正确输出 deleted_at
+    ↓
+API 响应 name 字段（包含 deleted_at）
+    ↓
+Bootstrap Table 接收数据
+    ↓
+polymorphicItemFormatter(value)  [第1752行]
+    ↓ value.deleted_at 存在（如果组件已删除）
+    ↓ ✅ 删除线逻辑正常触发
+    ↓
+显示为删除线样式
+```
+
+**Transformer 代码事实** (`app/Http/Transformers/AssetsTransformer.php:405-409`):
+```php
+'name' => [
+    'id' => $component_checkout->component?->id,
+    'name' => e($component_checkout->component?->display_name),
+    'type' => 'component',
+    'deleted_at' => $component_checkout->component?->deleted_at,  // ✅ 有输出！
+],
+```
+
+**场景 C：配件检出 assigned_to 字段 - 数据丢失**
+
+配件检出使用不同的 Transformer 方法链，同样缺失 `deleted_at`:
+```php
+// AccessoriesTransformer.php:117-129
+public function transformAssignedTo($accessoryCheckout)
+{
+    if ($accessoryCheckout->checkedOutToUser()) {
+        return (new UsersTransformer)->transformUserCompact($accessoryCheckout->assigned);
+        // ❌ transformUserCompact 不输出 deleted_at
+    } elseif ($accessoryCheckout->checkedOutToLocation()) {
+        return (new LocationsTransformer)->transformLocationCompact($accessoryCheckout->assigned);
+        // ❌ transformLocationCompact 不输出 deleted_at
+    } elseif ($accessoryCheckout->checkedOutToAsset()) {
+        return (new AssetsTransformer)->transformAssetCompact($accessoryCheckout->assigned);
+        // ❌ transformAssetCompact 不输出 deleted_at
+    }
+}
+```
+
+#### 4.4.3 Formatter 层的检查逻辑
+
+**文件位置**: `resources/views/partials/bootstrap-table.blade.php:1752-1753`
+
+```javascript
+// Show as strikethrough if it's been deleted
+if (value.deleted_at && value.deleted_at != '') {
+    return '<nobr><span class="text-muted" data-tooltip="true" title="{{ trans('general.deleted') }} ' + value.type + '"><del><i class="' + item_icon + ' fa-fw"></i> ' + value.name + '</del></span></nobr>';
+}
+```
+
+#### 4.4.4 现有描述与真实代码路径的差异
+
+| 现有描述 | 真实代码事实 |
+|---------|-------------|
+| 「`deleted_at` 字段完全不使用」 | 错误。Formatter 有检查逻辑，但 Transformer 在资产列表场景下没有输出该字段 |
+| 「`polymorphicItemFormatter` 会检查此状态显示删除线」 | 部分正确。代码中有这个逻辑，但在资产列表场景下由于数据缺失永远不会执行 |
+| 暗示 `deleted_at` 由资产对象携带 | 错误。`deleted_at` 是**分配目标对象**（用户/位置/资产等）的属性 |
+| 没有说明场景差异 | 实际上不同场景表现不同：<br>• 资产列表 assigned_to：❌ 无 deleted_at<br>• 组件检出 name：✅ 有 deleted_at<br>• 配件检出 assigned_to：❌ 无 deleted_at |
+
+#### 4.4.5 跨场景一致性对比表
+
+| 场景 | Presenter | Transformer 方法 | 是否输出 deleted_at | Formatter 删除线是否可用 |
+|------|-----------|-----------------|---------------------|-------------------------|
+| 资产列表 | `AssetPresenter.php:108` | `transformAssignedTo()` | ❌ 否 | ❌ 不可用 |
+| 组件检出 | `ComponentPresenter.php:215` | `transformCheckedoutComponents()` | ✅ 是 | ✅ 可用 |
+| 配件检出 | `AccessoryPresenter.php:219` | `transformAssignedTo()` | ❌ 否 | ❌ 不可用 |
+| 维护记录 | `MaintenancesPresenter.php:97` | 取决于维护 Transformer | 待确认 | 待确认 |
+| 历史记录 | `HistoryPresenter.php:100` | 取决于历史 Transformer | 待确认 | 待确认 |
+| 资产审计 | `AssetAuditPresenter.php:103` | 取决于审计 Transformer | 待确认 | 待确认 |
 
 ### 4.4 最终显示效果
 
