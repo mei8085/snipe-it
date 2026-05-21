@@ -350,6 +350,307 @@ public function destroy(Request $request, Asset $asset): RedirectResponse
 
 ---
 
+## 深度解析：三个关键协作机制
+
+### 一、全局 Gate 与策略判定的完整执行顺序
+
+这是最容易混淆的地方。Laravel 的授权系统有**明确的层级检查顺序**，Snipe-IT 在各层都植入了钩子，形成了一个 7 层的判定漏斗：
+
+```
+调用 Gate::allows($ability, $arguments)
+        ↓
+【第1层】 Gate::before() 全局前置钩子
+    在 AuthServiceProvider.php:112-122 定义
+    ├─ 演示模式检查（editableOnDemo）
+    ├─ 超级管理员检查 → true 直接放行，终止后续所有检查
+    └─ 返回 null → 继续
+        ↓
+【第2层】 检查是否有直接的 Gate::define() 定义
+    在 AuthServiceProvider.php:130-275 定义了 'admin', 'import', 'superuser', 'reports.view' 等
+    ├─ 有匹配的 Gate → 执行该闭包 → 返回 true/false → 终止
+    └─ 无匹配 → 继续向下查找 Policy
+        ↓
+【第3层】 解析 $arguments 找对应模型 → 查找绑定的 Policy 类
+    通过 AuthServiceProvider 的 $policies 数组映射
+    如 Asset::class → AssetPolicy::class
+        ↓
+【第4层】 Policy::before() 策略级前置钩子
+    在 SnipePermissionsPolicy.php:38-73 定义
+    ├─ admin 角色检查 → true 放行（但注意：这一层还没有检查公司范围？不，看代码顺序）
+    ├─ 检查是否为 Model 实例 → 不是实例则 return null 跳过公司检查
+    ├─ 公司范围检查 → false 直接拒绝
+    └─ 返回 null → 继续
+        ↓
+【第5层】 检查 Policy 类中是否有对应方法
+    如 view(), create(), update(), delete(), audit() 等
+    ├─ 有方法 → 调用该方法
+    └─ 无方法 → 检查 HandlesAuthorization trait 的兜底逻辑
+        ↓
+【第6层】 Policy 具体方法执行
+    如 AssetPolicy::update() → 调用 $user->hasAccess('assets.edit')
+        ↓
+【第7层】 底层权限位检查
+    User::hasAccess() → User::checkPermissionSection()
+    ├─ 用户个人权限检查（1=允许, -1=拒绝）
+    └─ 用户组权限遍历检查
+```
+
+**关键代码证据**：
+
+1. `Gate::before()` 是最外层，代码位置 `AuthServiceProvider.php:112`：
+```php
+Gate::before(function ($user, $ability) {
+    // 这里是整个系统的第一道闸门
+    if ($user->isSuperUser()) {
+        return true;  // 超级管理员直接返回true，后面所有层都走不到
+    }
+});
+```
+
+2. 直接 Gate 定义次之，代码位置 `AuthServiceProvider.php:170-174`：
+```php
+Gate::define('admin', function ($user) {
+    return $user->hasAccess('admin');
+});
+```
+> 当调用 `Gate::allows('admin')` 时，匹配到这个定义后直接返回，不会去找 Policy。
+
+3. Policy 的 `before()` 是策略级的，代码位置 `SnipePermissionsPolicy.php:38`：
+```php
+public function before(User $user, $ability, $item)
+{
+    if ($user->hasAccess('admin')) {
+        return true;  // admin在这里放行，但要注意：只有走到Policy层才会执行这里
+    }
+    // ... 公司范围检查
+}
+```
+
+> **致命区别**：`Gate::before()` 是全局的，对 ALL Gate 检查生效；`Policy::before()` 只对该模型的 Policy 检查生效。
+>
+> 例如：`Gate::allows('import')` 只会走前两层，不会走任何 Policy 层。
+
+**判定顺序总结表**：
+
+| 层级 | 执行位置 | 返回true | 返回false | 返回null | 适用场景 |
+|------|---------|---------|-----------|----------|---------|
+| 1. Gate::before() | 全局 | 终止，✅通过 | 终止，❌拒绝 | 继续 | 超级管理员豁免、演示模式 |
+| 2. Gate::define() | 全局 | 终止，✅通过 | 终止，❌拒绝 | 继续 | 通用权限（admin/import/reports） |
+| 3. Policy 查找 | 内核 | - | - | - | 根据模型找对应Policy |
+| 4. Policy::before() | 策略类 | 终止，✅通过 | 终止，❌拒绝 | 继续 | admin放行、公司范围检查 |
+| 5. Policy 方法 | 策略类 | ✅通过 | ❌拒绝 | - | 具体动作权限（view/create/edit） |
+
+---
+
+### 二、控制器授权 vs 路由中间件：触发路径分流
+
+**同一个权限检查，从不同入口调用，走的代码路径完全不同**。这是理解系统的核心。
+
+#### 路径A：路由中间件 `authorize:xxx`
+
+**代码路径**：`routes/web.php` → `Kernel.php` → `CheckPermissions.php` → `Gate::allows($section)`
+
+```
+HTTP Request
+    ↓
+[路由匹配] 匹配到路由定义：middleware => ['auth', 'authorize:superuser']
+    ↓
+[中间件栈] 按顺序执行
+    ├─ auth 中间件 → 认证
+    └─ authorize 中间件（CheckPermissions.php:21）
+            ↓
+            Gate::allows('superuser')
+                ↓
+                【只走第1-2层】Gate::before() → Gate::define('superuser')
+                （不会走到任何 Policy！因为没有传模型参数）
+            ↓
+            ✅ 放行 → 进入控制器
+            ❌ 拒绝 → 返回403页面
+```
+
+**典型用法**（代码位置 `routes/web.php:155`）：
+```php
+Route::group(['prefix' => 'admin', 'middleware' => ['auth', 'authorize:superuser']], function () {
+    Route::get('settings', [SettingsController::class, 'getSettings']);
+    // ...
+});
+```
+
+**特点**：
+- ✅ 粗粒度过滤，适合整个路由组
+- ❌ 不传模型实例，**不会触发 Policy 层**，更不会触发公司范围检查
+- ❌ 只检查简单的 Gate（如 'superuser', 'admin', 'import'）
+- ⚠️ 在控制器方法执行**之前**就触发
+
+#### 路径B：控制器内 `$this->authorize()`
+
+**代码路径**：控制器方法 → `AuthorizesRequests trait` → `Gate::authorize()` → 完整7层检查
+
+```
+HTTP Request
+    ↓
+[中间件栈] auth 等基础中间件通过
+    ↓
+[控制器方法] AssetsController::edit($asset)
+    ↓
+    $this->authorize('update', $asset)  /  $this->authorize($asset)
+            ↓
+            Gate::authorize('update', $asset)
+                ↓
+                【完整走7层】
+                Gate::before() → Gate::define() → 找Policy → Policy::before() → Policy::update()
+                （因为传了$asset实例，所以会触发公司范围检查！）
+            ↓
+            ✅ 放行 → 继续执行控制器逻辑
+            ❌ 拒绝 → 抛出 AuthorizationException → 渲染403
+```
+
+**典型用法对比**：
+
+| 调用方式 | 代码示例 | 触发公司检查 | 走Policy层 | 适用场景 |
+|---------|---------|------------|-----------|---------|
+| 传类名 | `$this->authorize('index', Asset::class)` | ❌ 不会 | ✅ 会 | 列表页、创建页 |
+| 传实例 | `$this->authorize('view', $asset)` | ✅ 会 | ✅ 会 | 查看、编辑、删除具体资产 |
+| 只传实例 | `$this->authorize($asset)` | ✅ 会 | ✅ 会 | 自动推断动作（edit→update） |
+
+**关键证据**在 `SnipePermissionsPolicy.php:61-63`：
+```php
+if (! $item instanceof Model) {
+    return;  // 传类名时，这里返回null，跳过下面的公司检查
+}
+// 只有传实例时才会走到这里
+if (! Company::isCurrentUserHasAccess($item)) {
+    return false;
+}
+```
+
+**执行时间线对比**：
+
+```
+请求到达
+    ↓
+[0ms]  全局中间件（StartSession, EncryptCookies...）
+    ↓
+[10ms] 路由中间件 auth → 认证通过
+    ↓
+[12ms] 路由中间件 authorize:xxx → 路径A检查（如果定义了的话）
+    ↓
+[15ms] 控制器构造函数执行
+    ↓
+[20ms] 控制器方法执行
+    ↓
+[22ms] 控制器内 $this->authorize() → 路径B检查 ⭐
+    ↓
+[30ms] 执行业务逻辑
+```
+
+> **分流结论**：路由中间件是"门卫"，在门口就拦住粗粒度权限；控制器授权是"安检"，在具体操作前做精细检查。两者可以叠加使用。
+
+---
+
+### 三、同角色不同入口结果不一致：定位排查指南
+
+这是开发中最容易踩的坑。当"同一个用户、同一个权限，在A页面可以，B页面不行"时，按以下步骤排查：
+
+#### 【第一步】确认调用路径：是中间件还是控制器？
+
+检查路由定义和控制器代码：
+
+```bash
+# 先看路由有没有 authorize 中间件
+grep -n "authorize:" routes/web.php routes/api.php
+
+# 再看控制器有没有 $this->authorize()
+grep -n "authorize(" app/Http/Controllers/Assets/AssetsController.php
+```
+
+**典型不一致场景1：中间件检查 vs 控制器检查**
+
+- `/admin/settings` 路由有 `authorize:superuser` 中间件 → 走 Gate 检查
+- `/hardware/1/edit` 控制器调用 `$this->authorize($asset)` → 走完整 Policy 检查
+
+如果一个用户有 `superuser` 权限但公司范围不匹配：
+- ✅ 访问 `/admin/settings` 通过（中间件只检查 superuser Gate）
+- ❌ 访问 `/hardware/1/edit` 拒绝（控制器检查触发了公司范围）
+
+#### 【第二步】确认参数类型：传的是类名还是实例？
+
+检查 `authorize()` 的第二个参数：
+
+```php
+// ✅ 传类名 - 不会触发公司范围检查
+$this->authorize('index', Asset::class);
+
+// ✅ 传实例 - 会触发公司范围检查
+$this->authorize('view', $asset);
+```
+
+**典型不一致场景2：列表页 vs 详情页**
+
+- 资产列表页 `index()` 调用 `$this->authorize('index', Asset::class)` → 传类名，跳过公司检查
+- 资产详情页 `show()` 调用 `$this->authorize('view', $asset)` → 传实例，触发公司检查
+
+同用户有 `assets.view` 权限，但资产不在其公司范围内：
+- ✅ 列表页能看到资产（SQL查询已经做了公司范围过滤）
+- ❌ 点进去看详情被拒绝（Policy 层再次检查公司范围）
+
+> 代码证据 `SnipePermissionsPolicy.php:61-71`：传类名时 `!$item instanceof Model` 为 true，直接 return，跳过公司检查。
+
+#### 【第三步】确认权限节点：检查的是同一个 ability 吗？
+
+看似都是"编辑权限"，实际检查的可能完全不同：
+
+| 调用代码 | 实际检查的 ability |
+|---------|-------------------|
+| `Gate::allows('admin')` | `'admin'` |
+| `$this->authorize('update', $asset)` | `'update'`（Policy方法）→ 内部检查 `'assets.edit'` |
+| `$this->authorize('manage', $asset)` | `'manage'`（Policy方法）→ 内部检查 `'assets.checkin' OR 'assets.edit' OR 'assets.checkout'` |
+| `$user->hasAccess('assets.edit')` | `'assets.edit'`（直接查权限位） |
+
+**典型不一致场景3：ability 不匹配**
+
+- 中间件 `authorize:admin` 检查的是 `'admin' 这个 Gate`
+- 控制器 `$this->authorize('update', $asset)` 检查的是 Policy 的 `update()` 方法 → 内部检查 `'assets.edit'`
+
+一个用户有 `admin` 全局权限但没有 `assets.edit` 权限位：
+- ✅ 通过中间件检查
+- ❌ 被控制器授权拒绝（因为 Policy 层检查的是具体的 assets.edit 权限位）
+
+> 注意：`SnipePermissionsPolicy::before()` 中 `$user->hasAccess('admin')` 会放行 admin，但这只在走到 Policy 层时才生效！
+
+#### 【第四步】定位工具：权限检查追踪
+
+当上述步骤还无法定位时，可以在关键位置临时加入调试代码：
+
+```php
+// 在 User::checkPermissionSection() 开头加入：
+\Log::debug("[PERMISSION CHECK] section=$section, user={$this->id}", [
+    'user_permissions' => $this->permissions,
+    'groups' => $this->groups->pluck('id', 'name')->toArray(),
+]);
+
+// 在 SnipePermissionsPolicy::before() 开头加入：
+\Log::debug("[POLICY BEFORE] ability=$ability, is_model=" . ($item instanceof Model ? 'yes' : 'no'), [
+    'item_class' => is_object($item) ? get_class($item) : $item,
+    'item_id' => is_object($item) && isset($item->id) ? $item->id : null,
+    'user_is_admin' => $user->hasAccess('admin'),
+]);
+```
+
+**排查清单（按优先级）**：
+
+| 检查项 | 检查方法 | 常见坑 |
+|-------|---------|-------|
+| 1. 调用入口 | 看路由和控制器 | 是中间件调用还是控制器调用？ |
+| 2. 参数类型 | `$this->authorize(?, ?)` 第二个参数 | 是 `Asset::class` 还是 `$asset`？ |
+| 3. Ability | 看第一个参数 | 是 `'view'`/`'update'` 还是 `'admin'`/`'superuser'`？ |
+| 4. 公司范围 | 检查 `$asset->company_id` 和用户可访问公司 | 多公司模式下最容易出问题 |
+| 5. 软删除状态 | 检查 `$asset->deleted_at` | `delete()` 方法会拒绝已删除的资产 |
+| 6. 演示模式 | `config('app.lock_passwords')` | 演示模式下 `editableOnDemo` Gate 会返回 false |
+| 7. 权限优先级 | 用户权限 vs 用户组权限 | 用户 `-1` 拒绝优先级最高，会覆盖组权限 |
+
+---
+
 ## 各层职责对比表
 
 | 层级 | 核心文件 | 主要职责 | 能否最终拍板 |
@@ -387,3 +688,46 @@ A: 三层各改一处：
 1. 声明层：`config/permissions.php` 增加 `assets.archive` 项
 2. 策略层：`AssetPolicy.php` 增加 `archive()` 方法调用 `hasAccess('assets.archive')`
 3. 拦截层：在控制器对应方法调用 `$this->authorize('archive', $asset)`
+
+---
+
+**Q: Gate::before() 和 Policy::before() 有什么本质区别？**
+A: 三个关键区别：
+1. **作用范围不同**：`Gate::before()` 是全局的，对 ALL 权限检查生效；`Policy::before()` 只对特定模型的 Policy 生效
+2. **执行顺序不同**：`Gate::before()` 是第1层，`Policy::before()` 是第4层，中间还隔了 `Gate::define()` 匹配
+3. **豁免机制不同**：超级管理员在 `Gate::before()` 就被放行，所有后续检查（包括公司范围）都跳过；普通 admin 在 `Policy::before()` 放行，受公司范围约束
+
+例如 `Gate::allows('import')` 只会走 `Gate::before()`，不会走任何 Policy 层的 `before()`。
+
+---
+
+**Q: 为什么我在路由中间件加了 `authorize:admin`，但控制器里还要再 authorize 一次？**
+A: 两者检查的维度完全不同，是互补关系而非重复：
+1. **中间件 `authorize:admin`**：检查用户是否有全局 admin 角色，粗粒度过滤，不传模型，不检查公司范围，在控制器执行前就触发
+2. **控制器 `$this->authorize('update', $asset)`**：检查具体动作权限（如 assets.edit），传模型实例，会检查公司范围，在控制器方法内触发
+
+典型组合使用场景：
+- 路由中间件 `authorize:admin` 拦住非管理员
+- 控制器内 `$this->authorize('delete', $asset)` 拦住越权操作其他公司资产的管理员
+
+---
+
+**Q: 同一个用户，列表页能看到资产，但点详情就 403，这是什么原因？**
+A: 90% 概率是**传参类型导致的公司范围检查差异**：
+- 列表页 `index()`：`$this->authorize('index', Asset::class)` → 传类名，`Policy::before()` 中 `!$item instanceof Model` 为 true，跳过公司检查
+- 详情页 `show()`：`$this->authorize('view', $asset)` → 传实例，触发 `Company::isCurrentUserHasAccess($item)` 检查
+
+资产虽然在 SQL 查询层被公司范围过滤了，但 Policy 层会做第二次校验。如果数据不一致（如资产被转移了公司但缓存没清），就会出现列表能看到但详情打不开的情况。
+
+另一个可能：列表页走的是中间件检查，详情页走的是控制器检查，两者检查的 ability 不同。
+
+---
+
+**Q: 我给用户加了 admin 角色，为什么还是被拒绝？**
+A: 检查调用路径：
+1. 如果调用路径是 `Gate::allows('assets.edit')` → 只走前两层，`Gate::before()` 检查 superuser，然后找 `Gate::define('assets.edit')`（没定义），所以返回 false
+2. 如果调用路径是 `$this->authorize('update', $asset)` → 走完整7层，`Policy::before()` 会检查 admin 并放行
+
+**关键**：admin 角色的放行逻辑在 `Policy::before()` 中，只有走到 Policy 层才会生效。如果直接调用 `Gate::allows('assets.edit')` 而不传模型，是走不到 Policy 层的。
+
+正确写法：`Gate::allows('update', $asset)` 或 `$user->can('update', $asset)`，传模型参数才能触发完整检查链。
