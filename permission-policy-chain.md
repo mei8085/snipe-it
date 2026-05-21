@@ -368,15 +368,19 @@ grep -rn "Gate::define.*superuser" app/
 
 ---
 
-#### Laravel 授权系统的真实执行顺序（6 层判定漏斗）
+#### Laravel 授权系统的真实执行顺序（6 层判定漏斗 + 短路机制）
 
 ```
 调用 Gate::allows($ability, $arguments)
         ↓
 【第1层】 Gate::before() 全局前置钩子 ⭐
     在 AuthServiceProvider.php:112-122 定义
-    ├─ 演示模式检查（editableOnDemo）→ false 直接拒绝
-    ├─ 超级管理员检查 $user->isSuperUser() → true 直接放行，终止所有后续检查
+    ├─ 演示模式检查（editableOnDemo）
+    │   ├─ true → 返回 false ❌ 直接拒绝，短路！后面所有层都不执行
+    │   └─ false → 继续
+    ├─ 超级管理员检查 $user->isSuperUser()
+    │   ├─ true → 返回 true ✅ 直接放行，短路！后面所有层都不执行
+    │   └─ false → 继续
     └─ 返回 null → 继续
         ↓
 【第2层】 解析 $arguments，查找绑定的 Policy 类
@@ -384,28 +388,122 @@ grep -rn "Gate::define.*superuser" app/
     ├─ 有模型 & 有 Policy 注册 → 进入 Policy 流程（第3-4层）
     └─ 无模型 / 无 Policy → 跳过 Policy，直接去第5层
         ↓
-【第3层】 Policy::before() 策略级前置钩子
+【第3层】 Policy::before() 策略级前置钩子 ⚡
     在 SnipePermissionsPolicy.php:38-73 定义
-    ├─ admin 角色检查 $user->hasAccess('admin') → true 放行
-    ├─ 检查是否为 Model 实例 → 不是实例则 return null（跳过公司检查）
-    ├─ 公司范围检查 Company::isCurrentUserHasAccess() → false 直接拒绝
+    ├─ admin 角色检查 $user->hasAccess('admin')
+    │   ├─ true → 返回 true ✅ 短路！跳过公司检查和 Policy 具体方法
+    │   └─ false → 继续
+    ├─ 检查是否为 Model 实例
+    │   ├─ 不是实例 → 返回 null（跳过公司检查），继续
+    │   └─ 是实例 → 继续
+    ├─ 公司范围检查 Company::isCurrentUserHasAccess()
+    │   ├─ false → 返回 false ❌ 短路！拒绝访问，Policy 具体方法不执行
+    │   └─ true → 继续
     └─ 返回 null → 继续
         ↓
 【第4层】 Policy 具体方法执行
     如 view(), create(), update(), delete(), audit() 等
     ├─ 有方法 → 调用该方法 → 通常返回 $user->hasAccess('xxx.yyy')
+    │   ├─ true → ✅ 通过
+    │   └─ false/null → 继续
     └─ 无方法 → 返回 null，继续
         ↓
-【第5层】 检查是否有直接的 Gate::define() 定义 ⚠️
+【第5层】 检查是否有直接的 Gate::define() 定义
     在 AuthServiceProvider.php:130-275 定义了 'admin', 'import', 'reports.view' 等
     ├─ 有匹配的 Gate → 执行该闭包 → 返回 true/false → 终止
     └─ 无匹配 → 继续
         ↓
-【第6层】 底层权限位检查（兜底）
-    → 如果以上所有层都没返回结果，返回 false
+【第6层】 兜底
+    → 如果以上所有层都没返回 true，返回 false ❌
 ```
 
 > **关键顺序修正**：Policy 检查（第3-4层）在 Gate::define 检查（第5层）**之前**！不是之后！
+>
+> **关键短路修正**：任何一层返回 `true` 或 `false`（非 null），都会**立即终止**后续所有检查！
+
+---
+
+#### ⚡ 短路行为详解：Policy::before 返回 true 后，后续策略方法不会执行！
+
+这是最关键的一点。`Policy::before()` 返回 `true` 后，**不仅跳过公司检查，连 Policy 的具体方法（如 view/update/delete）也不会执行**。
+
+**Snipe-IT 代码中的证据**（`SnipePermissionsPolicy.php:57-60` 注释）：
+```php
+/**
+ * If we got here by $this->authorize('something', $actualModel) then we can continue on, but if we got here
+ * via $this->authorize('something', Model::class) then calling Company::isCurrentUserHasAccess($item) gets weird.
+ * Bail out here by returning "nothing" and allow the relevant method lower in this class to be called and handle authorization.
+ */
+if (! $item instanceof Model) {
+    return;  // 返回 null，继续执行下面的方法
+}
+```
+
+注释明确说明：**返回 "nothing"（即 null）才会继续执行下面的方法**。反过来，如果返回 `true` 或 `false`，下面的方法就不会被调用。
+
+**Laravel 官方文档证据**：
+> "If the `before` callback returns a non-null result that result will be considered the result of the check."
+>
+> "If `null` is returned, the authorization will fall through to the policy method."
+
+---
+
+### 🔥 Gate::before vs Policy::before：返回值语义完全对齐
+
+| 返回值 | Gate::before() 后果 | Policy::before() 后果 | 行为一致性 |
+|-------|--------------------|----------------------|-----------|
+| **`true`** | ✅ 通过，**短路**<br>所有后续层（包括 Policy 所有方法、Gate::define）都不执行 | ✅ 通过，**短路**<br>公司检查、Policy 具体方法、Gate::define 都不执行 | 💯 完全一致 |
+| **`false`** | ❌ 拒绝，**短路**<br>所有后续层都不执行 | ❌ 拒绝，**短路**<br>Policy 具体方法、Gate::define 都不执行 | 💯 完全一致 |
+| **`null`** | ➡️ 继续执行下一层 | ➡️ 继续执行 Policy 具体方法 | 💯 完全一致 |
+
+---
+
+### 经典场景分析：admin 角色的完整短路路径
+
+```
+$this->authorize('update', $asset)
+    ↓
+【第1层】Gate::before()
+    ├─ 演示模式？→ 否
+    ├─ isSuperUser()？→ 否（是 admin 不是 superuser）
+    └─ 返回 null → 继续
+        ↓
+【第2层】有 $asset 模型，有 AssetPolicy 注册 → 进入 Policy
+        ↓
+【第3层】Policy::before()
+    ├─ $user->hasAccess('admin')？→ true
+    │   └─ 返回 true ✅ **短路！**
+    ├─ （公司范围检查被跳过）
+    └─ （Policy::update() 方法永不执行）
+        ↓
+✅ 授权通过，执行业务逻辑
+```
+
+**重要结论**：admin 角色在 `Policy::before()` 返回 `true` 后，**后面的一切检查（包括公司范围检查、assets.edit 权限位检查）全部被跳过**。这就是为什么 admin 可以操作所有公司的资产——不是跳过了公司检查，而是**公司检查根本没机会执行**。
+
+---
+
+### 经典场景分析：公司范围不匹配的拒绝路径
+
+```
+$this->authorize('view', $asset)  // 普通用户，非 superuser，非 admin
+    ↓
+【第1层】Gate::before() → 返回 null
+        ↓
+【第2层】有模型，有 Policy → 继续
+        ↓
+【第3层】Policy::before()
+    ├─ isSuperUser()？→ 否
+    ├─ isAdmin()？→ 否
+    ├─ 是 Model 实例？→ 是
+    ├─ Company::isCurrentUserHasAccess($item)？→ false
+    │   └─ 返回 false ❌ **短路！**
+    └─ （Policy::view() 方法永不执行）
+        ↓
+❌ 授权失败，403
+```
+
+**重要结论**：公司范围检查在 `Policy::before()` 中返回 `false` 后，**具体的 `assets.view` 权限位检查根本没机会执行**。即使该用户有 `assets.view` 权限，只要公司不匹配，就会被拒绝。
 
 ---
 
@@ -465,22 +563,24 @@ Gate::define('import', function ($user) {
 
 | 钩子 | 触发条件 | 不触发条件 | 返回值语义 |
 |------|---------|-----------|-----------|
-| **Gate::before()** | ✅ 总是触发，对 ALL Gate 检查生效 | ❌ 从不（除非抛异常） | `true`=通过<br>`false`=拒绝<br>`null`=继续 |
-| **Policy::before()** | ✅ 传了模型参数（类名/实例）<br>✅ 该模型有 Policy 注册<br>✅ Gate::before() 返回了 null | ❌ 没传模型参数<br>❌ 没有 Policy 注册<br>❌ Gate::before() 已返回 true/false | `true`=通过<br>`false`=拒绝<br>`null`=继续 |
-| **Gate::define()** | ✅ ability 字符串精确匹配<br>✅ 前面所有层都返回了 null | ❌ ability 不匹配<br>❌ 前面已有层返回 true/false | `true`=通过<br>`false`=拒绝<br>`null`=继续 |
+| **Gate::before()** | ✅ 总是触发，对 ALL Gate 检查生效 | ❌ 从不（除非抛异常） | `true`=通过，**短路**<br>`false`=拒绝，**短路**<br>`null`=继续 |
+| **Policy::before()** | ✅ 传了模型参数（类名/实例）<br>✅ 该模型有 Policy 注册<br>✅ Gate::before() 返回了 null | ❌ 没传模型参数<br>❌ 没有 Policy 注册<br>❌ Gate::before() 已返回 true/false | `true`=通过，**短路**<br>`false`=拒绝，**短路**<br>`null`=继续 |
+| **Gate::define()** | ✅ ability 字符串精确匹配<br>✅ 前面所有层都返回了 null | ❌ ability 不匹配<br>❌ 前面已有层返回 true/false | `true`=通过，**短路**<br>`false`=拒绝，**短路**<br>`null`=继续 |
 
 ---
 
-**判定顺序总结表**：
+**判定顺序总结表（含短路标记）**：
 
 | 层级 | 执行位置 | 执行时机 | 返回true | 返回false | 返回null | 典型检查 |
 |------|---------|---------|---------|-----------|----------|---------|
-| 1. Gate::before() | 全局 | 最先 | 终止，✅ | 终止，❌ | 继续 | superuser 豁免、演示模式 |
+| 1. **Gate::before()** | 全局 | 最先 | 🔴 终止，✅ | 🔴 终止，❌ | ➡️ 继续 | superuser 豁免、演示模式 |
 | 2. Policy 查找 | 内核 | Gate::before 之后 | - | - | - | 解析模型参数 |
-| 3. Policy::before() | 策略类 | 有模型参数时 | 终止，✅ | 终止，❌ | 继续 | admin 放行、公司范围 |
-| 4. Policy 方法 | 策略类 | Policy::before 之后 | ✅ | ❌ | 继续 | assets.edit, assets.view |
-| 5. Gate::define() | 全局 | 最后 | 终止，✅ | 终止，❌ | 继续 | admin, import, reports.view |
+| 3. **Policy::before()** | 策略类 | 有模型参数时 | 🔴 终止，✅ | 🔴 终止，❌ | ➡️ 继续 | admin 放行、公司范围 |
+| 4. **Policy 方法** | 策略类 | Policy::before 之后 | 🔴 终止，✅ | 🔴 终止，❌ | ➡️ 继续 | assets.edit, assets.view |
+| 5. **Gate::define()** | 全局 | 最后 | 🔴 终止，✅ | 🔴 终止，❌ | ➡️ 继续 | admin, import, reports.view |
 | 6. 兜底 | 内核 | 所有层都没返回 | - | ❌ | - | 默认拒绝 |
+
+> 🔴 标记表示该返回值会**短路**（short-circuit），后续所有层都不再执行。
 
 > **致命区别**：`Gate::before()` 对 ALL 检查生效；`Policy::before()` 只对传了模型参数的检查生效。
 >
@@ -752,25 +852,65 @@ $this->authorize('view', $asset);
 ## 关键设计洞察
 
 1. **双重 `before` 钩子**：`Gate::before()`（全局）+ `Policy::before()`（策略级），形成灵活的豁免机制，但两者触发条件完全不同
-2. **权限前缀约定**：通过 `columnName()` 方法约定权限前缀（如 `assets` + `.view`），大量减少重复代码
-3. **"或"逻辑权限**：如 `manage` 权限是多个权限的 OR 组合，体现了策略层的灵活性
-4. **软删除感知**：`delete` 方法中检查 `$item->deleted_at`，已删除的资产不能再删除
-5. **公司范围隔离**：多公司模式下，即使有权限，也只能操作本公司的资产，但 admin 角色在 `Policy::before()` 中会跳过公司检查
-6. **权限优先级**：用户个人权限（尤其是 `-1` 拒绝）优先级高于用户组权限
-7. **巧妙的 "无定义" 设计**：`superuser` 没有 `Gate::define()`，完全靠 `Gate::before()` 处理，使得 superuser 豁免逻辑集中在一处
-8. **执行顺序反直觉**：Policy 检查在 Gate::define 之前，而不是之后，这是 Laravel 内核的默认行为
-9. **命名不统一陷阱**：`authorize:superuser` 和 `authorize:superadmin` 实际效果完全相同，都是检查 `'superuser'` 权限位
-10. **admin 角色的双重性**：admin 角色的放行逻辑只在 Policy 层生效，中间件检查 `authorize:admin` 看的是 `'admin'` 权限位，两者不是一回事
+2. **统一的短路语义**：`Gate::before()` 和 `Policy::before()` 的返回值语义 100% 对齐——`true`/`false` 短路，`null` 继续
+3. **权限前缀约定**：通过 `columnName()` 方法约定权限前缀（如 `assets` + `.view`），大量减少重复代码
+4. **"或"逻辑权限**：如 `manage` 权限是多个权限的 OR 组合，体现了策略层的灵活性
+5. **软删除感知**：`delete` 方法中检查 `$item->deleted_at`，已删除的资产不能再删除
+6. **公司范围隔离**：多公司模式下，即使有权限，也只能操作本公司的资产，但 admin 角色在 `Policy::before()` 中 `return true` 短路，**公司检查根本没机会执行**
+7. **权限优先级**：用户个人权限（尤其是 `-1` 拒绝）优先级高于用户组权限
+8. **巧妙的 "无定义" 设计**：`superuser` 没有 `Gate::define()`，完全靠 `Gate::before()` 处理，使得 superuser 豁免逻辑集中在一处
+9. **执行顺序反直觉**：Policy 检查在 Gate::define 之前，而不是之后，这是 Laravel 内核的默认行为
+10. **命名不统一陷阱**：`authorize:superuser` 和 `authorize:superadmin` 实际效果完全相同，都是检查 `'superuser'` 权限位
+11. **admin 角色的双重性**：admin 角色的放行逻辑只在 Policy 层生效，中间件检查 `authorize:admin` 看的是 `'admin'` 权限位，两者不是一回事
+12. **传参决定一切**：传 `Asset::class` 还是 `$asset` 实例，决定了是否触发公司范围检查，也决定了 admin 角色豁免是否生效
 
 ---
 
 ## 常见疑问解答
 
+---
+
+### 🔌 短路行为专题
+
+**Q: Policy::before 返回 true 后，还会执行后续的策略方法吗？**
+A: **绝对不会！** 这是最关键的短路行为。
+
+根据 Laravel 官方文档和代码注释双重验证：
+- `Policy::before()` 返回 **`true`** → ✅ 通过，**短路**，后续的公司范围检查、Policy 具体方法（view/update/delete）、Gate::define 全部不执行
+- `Policy::before()` 返回 **`false`** → ❌ 拒绝，**短路**，后续所有检查都不执行
+- `Policy::before()` 返回 **`null`**（或 `return;` 无值）→ ➡️ 继续执行后续检查
+
+**Snipe-IT 代码中的直接证据**（`SnipePermissionsPolicy.php:57-60` 注释）：
+> "Bail out here by returning 'nothing' and allow the relevant method lower in this class to be called and handle authorization."
+
+翻译：只有返回"nothing"（即 null）时，才允许调用下面的方法。反过来，返回 `true` 或 `false` 时，下面的方法不会被调用。
+
+**实际影响**：
+- admin 角色在 `Policy::before()` 返回 `true` → 公司范围检查、`assets.edit` 权限位检查，全部跳过
+- 公司范围不匹配在 `Policy::before()` 返回 `false` → `assets.view` 权限位检查，跳过
+
+---
+
+**Q: Gate::before 和 Policy::before 的短路行为完全一样吗？**
+A: **是的，语义 100% 对齐**，只是作用范围不同：
+
+| 返回值 | Gate::before() 后果 | Policy::before() 后果 |
+|-------|--------------------|----------------------|
+| **`true`** | ✅ 通过，短路，所有后续层都不执行 | ✅ 通过，短路，Policy 方法 + 后续层都不执行 |
+| **`false`** | ❌ 拒绝，短路，所有后续层都不执行 | ❌ 拒绝，短路，Policy 方法 + 后续层都不执行 |
+| **`null`** | ➡️ 继续下一层 | ➡️ 继续执行 Policy 方法 |
+
+---
+
 **Q: 为什么管理员能看到所有资产，但普通用户只能看到本公司的？**
 A: 在 `SnipePermissionsPolicy::before()` 中，`admin` 角色直接 `return true` 跳过了公司检查。
 
 **Q: 超级管理员和管理员有什么区别？**
-A: 超级管理员（`superuser`）在最外层 `Gate::before()` 就放行，不受任何约束；管理员（`admin`）在策略层放行，但仍受多公司范围约束。
+A: 两者的放行层面不同，短路时机不同：
+1. **超级管理员（superuser）**：在第1层 `Gate::before()` 就返回 `true` 短路，**所有后续层都不执行**，不受任何约束
+2. **管理员（admin）**：在第3层 `Policy::before()` 返回 `true` 短路，**跳过公司范围检查和具体权限位检查**，但只对传了模型参数的检查生效
+
+> **修正之前的错误**：admin 不是"仍受多公司范围约束"，恰恰相反——admin 在 `Policy::before()` 返回 `true` 后，**公司范围检查根本没机会执行**，所以 admin 可以操作所有公司的资产。
 
 **Q: 中间件 `authorize:superuser` 和控制器 `$this->authorize()` 是什么关系？**
 A: 两者是互补的。中间件适合粗粒度的路由组过滤（如整个后台都需要 superuser），控制器内授权适合精细到动作的检查（如查看、编辑、删除各自的权限）。
