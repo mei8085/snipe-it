@@ -313,40 +313,49 @@ public function handleFile(string $dirname, string $name_prefix, $file): string
 
 #### 3.5.1.1 失败路径的三层设计缺陷
 
-##### 缺陷 1：`Storage::put()` 无返回值检查
+##### 缺陷 1：`Storage::put()` 返回值完全未检查
 
-Laravel `Storage::put()` 的返回值语义：
-- 本地存储驱动：返回 `true`（成功）或抛出异常（失败）
-- S3/云存储驱动：返回 `false`（失败）或抛出异常（失败）
-- **关键**：该方法可能抛出异常，也可能返回布尔值
+基于 Snipe-IT 项目配置（`config/filesystems.php`），系统支持多种存储驱动：
+- **默认驱动**：`local`（本地文件系统）
+- **可选驱动**：`s3_public`、`s3_private`、`rackspace`
 
-但 `handleFile()` 完全忽略了返回值：
+Laravel `Storage::put()` 的契约层面行为（不绑定具体驱动）：
+- 方法签名：`put($path, $contents, $options = [])`
+- 返回值：布尔值（`true` 成功 / `false` 失败）或抛出异常
+- 异常类型：因驱动实现而异，可能是 `\RuntimeException`、`\League\Flysystem\UnableToWriteFile` 等
+
+在 `handleFile()` 中，返回值被完全忽略：
 ```php
-// 既不检查返回值，异常也被捕获
+// 既不检查布尔返回值，也不依赖异常向上传播
 Storage::put($dirname.$file_name, $uploaded_file);
 ```
+
+> ⚠️ 注意：此处不做驱动级绝对断言。无论底层驱动是返回 `false` 还是抛出异常，当前代码的防御机制都存在缺口——布尔返回值未检查，异常被 `try-catch` 吞掉，两种失败路径都无法传递到调用方。
 
 ##### 缺陷 2：异常捕获粒度过粗 + 日志级别过低
 
 ```php
-catch (\Exception $e) {
+try {
+    Storage::put($dirname.$file_name, $uploaded_file);
+} catch (\Exception $e) {
     Log::debug($e);  // debug 级别在生产环境默认关闭
 }
 ```
 
 - **捕获范围**：`\Exception` 捕获所有异常，包括内存溢出、磁盘故障、网络中断等严重错误
 - **日志级别**：`debug` 在 `APP_LOG_LEVEL=error` 的生产环境中会被完全丢弃
-- **无恢复逻辑**：捕获后没有任何回滚或补偿操作
+- **无恢复逻辑**：捕获后没有任何回滚或补偿操作，直接返回文件名
 
-##### 缺陷 3：函数签名设计缺陷
+##### 缺陷 3：函数签名设计缺陷（无失败返回通道）
 
 ```php
-public function handleFile(...): string
+public function handleFile(string $dirname, string $name_prefix, $file): string
 ```
 
 - 返回值类型声明为 `string`，从语法层面排除了失败返回的可能
 - 调用方无法通过返回值判断操作是否成功
-- 唯一能传递失败的方式是抛出异常，但被内部吞掉了
+- 唯一能传递失败的方式是抛出异常，但被内部 `try-catch` 吞掉了
+- 形成"永远成功"的接口语义，与实际运行时风险不匹配
 
 #### 3.5.1.2 为何 Storage 写入未确认仍会记录 `uploaded` 日志
 
@@ -364,15 +373,15 @@ $object->logUpload($file_name, $request->input('notes'));
 
 **设计溯源分析**：
 
-这种设计很可能源于两个隐含假设：
-1. **假设 Storage 写入总是成功**：将存储层视为绝对可靠，未考虑分布式系统的不可靠性
-2. **假设 handleFile 会抛出异常**：如果写盘失败，异常会向上传播，`logUpload` 不会执行。但实际上异常被内部吞掉了，这个假设不成立
+这种设计很可能源于两个隐含假设，但都不成立：
+1. ❌ **假设 Storage 写入总是成功**：将存储层视为绝对可靠，未考虑本地磁盘满、权限不足、S3 网络中断等实际故障场景
+2. ❌ **假设 handleFile 会抛出异常**：如果写盘失败，异常会向上传播，`logUpload` 不会执行。但实际上异常被内部 `try-catch` 吞掉了，调用方永远不会收到失败信号
 
 **时序对比**：
 
-| 预期设计（正确） | 实际设计（有缺陷） |
-|-----------------|-------------------|
-| ```php<br>try {<br>    $file_name = handleFile(...);<br>    if (!Storage::exists($file_name)) {<br>        throw new Exception('Write failed');<br>    }<br>    logUpload($file_name);<br>} catch (Exception $e) {<br>    // 回滚逻辑<br>}<br>``` | ```php<br>$file_name = handleFile(...);<br>// 此处缺少确认步骤<br>logUpload($file_name);  // 无条件执行<br>``` |
+| 预期设计（先确认后记录） | 实际设计（无条件记录） |
+|-------------------------|-----------------------|
+| ```php<br>try {<br>    $file_name = handleFile(...);<br>    // 关键：写盘后二次确认<br>    if (!Storage::exists($storagePath.$file_name)) {<br>        throw new RuntimeException('File write verification failed');<br>    }<br>    $object->logUpload($file_name, $notes);<br>} catch (Exception $e) {<br>    // 错误处理 + 用户提示<br>}<br>``` | ```php<br>$file_name = handleFile(...);<br>// 缺少确认步骤，直接写日志<br>$object->logUpload($file_name, $notes);<br>``` |
 
 #### 3.5.2 完整异常链路时序
 
@@ -448,34 +457,87 @@ WHERE item_type = 'App\Models\Maintenance'
 
 ##### 场景 2：下载/预览文件 (`show()` 方法)
 
-**Api/UploadedFilesController 中两处 file-not-found 对比分析**：
+**⚠️ 概念澄清：纠正 "file-not-found" 混用问题**
 
-`show()` 方法内有两处独立的 `file-not-found` 错误返回，触发条件和代码写法存在微妙但重要的差异：
+`show()` 方法内有两处独立的错误返回分支，分别对应**两种完全不同的失败场景**，之前文档中笼统称之为 "file-not-found" 是不准确的。以下是精确区分：
 
-| 位置 | 触发条件 | 代码 |
-|-----|---------|------|
-| 第 152-154 行 | `action_logs` 表中**不存在**该文件记录（DB 层面不存在） | `return response()->json(Helper::formatStandardApiResponse('error', null, trans('general.file_upload_status.invalid_id')), 200);` |
-| 第 156-158 行 | `action_logs` 表中有记录，但**磁盘文件不存在**（不一致场景） | `return response()->json(Helper::formatStandardApiResponse('error', null, trans('general.file_upload_status.file_not_found'), 200));` |
+---
 
-**⚠️ 关键代码细节差异**：
+#### 分支 1：`invalid_id` - DB 记录不存在
 
+**触发条件**：
+- 用户请求的 `file_id` 在 `action_logs` 表中不存在
+- 或者该记录不属于当前 `object_type` 和 `object_id`
+
+**代码位置**：`Api/UploadedFilesController.php:151-154`
 ```php
-// 第 153 行（DB 记录不存在）：200 是 response()->json() 的第二个参数
-return response()->json(
-    Helper::formatStandardApiResponse('error', null, trans('general.file_upload_status.invalid_id')), 
-    200  // ← 这里的 200 传给 response()->json()
-);
-
-// 第 157 行（磁盘文件不存在）：200 是 formatStandardApiResponse() 的第四个参数
-return response()->json(
-    Helper::formatStandardApiResponse('error', null, trans('general.file_upload_status.file_not_found'), 200)  
-    // ↑ 这里的 200 传给 formatStandardApiResponse()，但该函数只有 3 个参数！
-);
+// 检查 action_logs 表中是否存在该文件记录
+if (! $log = Actionlog::whereNotNull('filename')
+    ->where('item_type', self::$map_object_type[$object_type])
+    ->where('item_id', $object->id)
+    ->find($file_id)
+) {
+    return response()->json(Helper::formatStandardApiResponse(
+        'error', 
+        null, 
+        trans('general.file_upload_status.invalid_id')
+    ), 200);
+}
 ```
 
-**`Helper::formatStandardApiResponse` 函数签名**：
+**返回方式**：
+- HTTP 状态码：**显式指定** `200` 作为 `response()->json()` 的第二个参数
+- Payload：`{"status":"error","messages":"Invalid file ID","payload":null}`
+- 语义：用户请求的文件 ID 无效，可能是 URL 错误或记录已被删除
+
+---
+
+#### 分支 2：`file_not_found` - 物理文件不存在
+
+**触发条件**：
+- `action_logs` 表中**存在**该文件记录（DB 层面有效）
+- 但 `Storage::exists()` 检查发现**磁盘/存储中不存在**该物理文件
+- 这正是我们前面分析的"写盘失败导致数据不一致"场景的最终表现
+
+**代码位置**：`Api/UploadedFilesController.php:156-158`
 ```php
-// Helper.php:1134-1144
+// 检查物理文件是否存在
+if (! Storage::exists(self::$map_storage_path[$object_type].$log->filename)) {
+    return response()->json(Helper::formatStandardApiResponse(
+        'error', 
+        null, 
+        trans('general.file_upload_status.file_not_found'), 
+        200  // ⚠️  参数位置错误！
+    ));
+}
+```
+
+**返回方式**：
+- HTTP 状态码：**依赖默认值** `200`（`response()->json()` 不传状态码时的默认值）
+- Payload：`{"status":"error","messages":"File not found","payload":null}`
+- 语义：文件记录存在，但物理文件丢失，属于系统内部不一致
+
+---
+
+#### 两处分支对比表
+
+| 维度 | 分支 1：`invalid_id` | 分支 2：`file_not_found` |
+|-----|---------------------|-------------------------|
+| **失败层级** | DB 记录不存在 | DB 记录存在，物理文件不存在 |
+| **触发条件** | `action_logs` 查询返回 null | `Storage::exists()` 返回 false |
+| **`200` 参数位置** | `response()->json(..., 200)` ✅ 正确 | `formatStandardApiResponse(..., 200)` ❌ 错误 |
+| **参数有效性** | 参数有效，显式指定 200 | 参数无效，第 4 个参数被 PHP 静默忽略 |
+| **最终 HTTP 状态码** | `200 OK`（显式指定） | `200 OK`（依赖默认值） |
+| **错误消息** | "Invalid file ID" | "File not found" |
+| **典型场景** | 用户输入错误 URL、文件已被删除 | 上传时写盘失败、磁盘文件被误删、存储迁移遗漏 |
+| **是否系统缺陷** | ❌ 正常业务逻辑 | ✅ 反映系统内部数据不一致 |
+
+---
+
+#### 参数位置错误详解
+
+**`Helper::formatStandardApiResponse` 函数签名**（`Helper.php:1134-1144`）：
+```php
 public static function formatStandardApiResponse($status, $payload = null, $messages = null)
 {
     $array['status'] = $status;
@@ -491,18 +553,26 @@ public static function formatStandardApiResponse($status, $payload = null, $mess
 
 函数只有 3 个参数，因此第 157 行传入的第 4 个参数 `200` 会被 PHP **静默忽略**，不会对返回结果产生任何影响。
 
-**实际执行效果对比**：
+**代码对比**：
+```php
+// 第 153 行（正确）：200 传给 response()->json()
+return response()->json(
+    Helper::formatStandardApiResponse('error', null, trans('general.file_upload_status.invalid_id')), 
+    200  // ← 正确位置
+);
 
-| 场景 | HTTP 状态码 | Response Payload |
-|-----|------------|-----------------|
-| DB 记录不存在（第 153 行） | `200 OK` | `{"status":"error","messages":"Invalid file ID","payload":null}` |
-| 磁盘文件不存在（第 157 行） | `200 OK`（`response()->json()` 默认值） | `{"status":"error","messages":"File not found","payload":null}` |
+// 第 157 行（错误）：200 传给 formatStandardApiResponse()
+return response()->json(
+    Helper::formatStandardApiResponse('error', null, trans('general.file_upload_status.file_not_found'), 200)  
+    // ↑ 错误位置，被静默忽略
+);
+```
 
-两处最终返回的 HTTP 状态码**都是 200**，但到达方式不同：
-- 第 153 行：**显式指定** `200` 作为 `response()->json()` 的第二个参数
-- 第 157 行：**依赖默认值**，传入的 `200` 参数位置错误被忽略
+> 虽然当前两处最终都返回 200（因为 `response()->json()` 默认就是 200），但这个 bug 体现了代码可读性和可维护性问题——如果未来想将分支 2 改为返回 404，由于参数位置错误，修改会无效。
 
-**200 状态码 + 错误 payload 的设计意图与影响**：
+---
+
+#### 200 状态码 + 错误 payload 的设计意图与影响
 
 **设计意图推测**：
 这是一种"软错误"设计模式——始终返回 HTTP 200，通过 payload 中的 `status` 字段传递业务状态。这种设计常见于：
@@ -517,10 +587,12 @@ public static function formatStandardApiResponse($status, $payload = null, $mess
 | **前端集成** | 前端开发者容易依赖 HTTP 状态码判断成功，忽略 `payload.status`，导致"上传成功下载失败"的诡异体验 |
 | **API 调试** | `curl -I` 或浏览器开发者工具显示 200 OK，容易误导调试人员认为请求成功 |
 | **监控告警** | 基于 HTTP 状态码的监控（如 4xx/5xx 错误率）完全无法发现这类错误 |
-| **HTTP 语义破坏** | 404 Not Found 是标准的"资源不存在"语义，使用 200 OK 破坏了 RESTful API 设计原则 |
+| **HTTP 语义破坏** | 对于分支 2（物理文件不存在），404 Not Found 是标准的"资源不存在"语义，使用 200 OK 破坏了 RESTful API 设计原则 |
 | **缓存风险** | 200 响应可能被中间层缓存，导致错误被缓存 |
 
-**Web 版 vs API 版对比**：
+---
+
+#### Web 版 vs API 版对比
 
 Web 版 `UploadedFilesController::show()` 对同类错误的处理：
 ```php
@@ -535,10 +607,14 @@ if (! Storage::exists(...)) {
 - Web 版：302 重定向 + 会话级错误消息，用户能立即看到错误
 - API 版：200 OK + JSON payload 错误，需要前端主动检查 `status` 字段
 
+---
+
 **用户看到的结果**：
-- 返回 `File not found` 或 `Invalid file ID` 错误消息
-- HTTP 状态码却是 `200 OK`（容易被前端误认为成功）
+- 分支 1：返回 "Invalid file ID" 错误消息
+- 分支 2：返回 "File not found" 错误消息
+- 两处 HTTP 状态码都是 `200 OK`（容易被前端误认为成功）
 - 若前端未检查 `payload.status`，可能显示"下载成功"但实际无文件
+- 分支 2 的出现意味着系统中存在数据不一致，需要运维介入排查
 
 ##### 场景 3：删除文件 (`destroy()` 方法)
 
@@ -886,8 +962,8 @@ public function handleFile(string $dirname, string $name_prefix, $file): string
 | 上传失败静默吞异常 | `try-catch` + `Log::debug()` | `UploadFileRequest.php:56-60` |
 | `Storage::put()` 无返回值检查 | 忽略布尔返回值 | `UploadFileRequest.php:57` |
 | 调用方无成功校验 | 无条件调用 `logUpload()` | 4 个控制器共 4 处 |
-| API 下载 DB 记录不存在返回 | `formatStandardApiResponse` + 显式 200 | `Api/UploadedFilesController.php:153` |
-| API 下载磁盘文件不存在返回 | `formatStandardApiResponse` + 参数位置错误 | `Api/UploadedFilesController.php:157` |
+| API 下载 `invalid_id` 分支 | DB 记录不存在，`formatStandardApiResponse` + 显式 200 | `Api/UploadedFilesController.php:153` |
+| API 下载 `file_not_found` 分支 | DB 记录存在但物理文件不存在，参数位置错误 | `Api/UploadedFilesController.php:157` |
 | API 标准响应格式 | `Helper::formatStandardApiResponse()` | `Helper.php:1134-1144` |
 | 资产状态快照 | `creating` 观察者事件 | `MaintenanceObserver.php:15-23` |
 | 维护完成处理 | `complete()` 方法 + `saveQuietly()` | `MaintenancesController.php:245-270` |
@@ -1054,28 +1130,32 @@ if (! Storage::exists(self::$map_storage_path[$object_type].$log->filename)) {
 **代码位置**：`Api/UploadedFilesController.php:157`
 
 ```php
-// 第 153 行（正确）：200 传给 response()->json()
+// 第 153 行（invalid_id 分支，正确）：200 传给 response()->json()
 return response()->json(Helper::formatStandardApiResponse(
     'error', null, trans('general.file_upload_status.invalid_id')
 ), 200);
 
-// 第 157 行（错误）：200 传给 formatStandardApiResponse()，被静默忽略
+// 第 157 行（file_not_found 分支，错误）：200 传给 formatStandardApiResponse()，被静默忽略
 return response()->json(Helper::formatStandardApiResponse(
     'error', null, trans('general.file_upload_status.file_not_found'), 200
 ));
 ```
 
-**两处 file-not-found 返回代码对比**：
+**两处分支返回代码对比（已纠正概念混用）**：
 
-| 维度 | 第 153 行（DB 记录不存在） | 第 157 行（磁盘文件不存在） |
+| 维度 | 第 153 行：`invalid_id` 分支 | 第 157 行：`file_not_found` 分支 |
 |-----|---------------------------|-----------------------------|
-| 触发条件 | `action_logs` 表无记录 | `action_logs` 有记录但磁盘无文件 |
-| `200` 参数位置 | `response()->json()` 的第 2 个参数 | `formatStandardApiResponse()` 的第 4 个参数 |
+| 准确语义 | DB 记录不存在 | DB 记录存在，物理文件不存在 |
+| 触发条件 | `action_logs` 表查询返回 null | `Storage::exists()` 返回 false |
+| `200` 参数位置 | `response()->json()` 的第 2 个参数 ✅ | `formatStandardApiResponse()` 的第 4 个参数 ❌ |
 | 参数有效性 | ✅ 有效 | ❌ 无效（函数只有 3 个参数） |
 | 最终 HTTP 状态码 | `200 OK`（显式指定） | `200 OK`（依赖默认值） |
 | Response Payload | `{"status":"error","messages":"Invalid file ID","payload":null}` | `{"status":"error","messages":"File not found","payload":null}` |
+| 系统缺陷 | ❌ 正常业务逻辑 | ✅ 反映内部数据不一致 |
 
 **问题根源**：`Helper::formatStandardApiResponse($status, $payload, $messages)` 只有 3 个参数，第 4 个参数 `200` 被 PHP 静默忽略。
+
+> ⚠️ 概念澄清：之前文档中笼统将两处都称为 "file-not-found" 是不准确的。第 153 行是 `invalid_id`（DB 记录不存在），第 157 行才是真正的 `file_not_found`（物理文件不存在）。两者触发条件、语义和系统含义完全不同。
 
 ---
 
@@ -1088,5 +1168,6 @@ return response()->json(Helper::formatStandardApiResponse(
 6. **异常静默处理**：上传失败不提示用户，导致用户以为上传成功实际失败
 7. **路由模式特殊**：`/{object_type}/{id}/files` 模式容易被误记为 `/files/{object_type}/{id}`
 8. **API 软错误设计**：下载失败返回 HTTP 200 + `status:error`，不符合 RESTful 语义，容易误导调用方
-9. **参数位置错误**：第 157 行的 `200` 参数位置错误，降低代码可读性和可维护性
+9. **概念易混淆**：`invalid_id`（DB 记录不存在）与 `file_not_found`（物理文件不存在）两个分支语义相近，容易笼统称为"文件找不到"
+10. **参数位置错误**：第 157 行的 `200` 参数位置错误，降低代码可读性和可维护性
 
