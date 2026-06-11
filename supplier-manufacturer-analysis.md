@@ -353,11 +353,15 @@ public function manufacturer()
 | licenses | manufacturer_id | `database/migrations/2016_08_09_002225_add_manufacturer_to_licenses.php#L17` | `$table->integer('manufacturer_id')->nullable()` |
 | accessories | supplier_id | `database/migrations/2017_10_19_130406_add_image_and_supplier_to_accessories.php#L18` | `$table->integer('supplier_id')->nullable()->default(null)` |
 | accessories | manufacturer_id | `database/migrations/2016_08_12_121613_add_manufacturer_to_accessories_table.php#L16` | `$table->integer('manufacturer_id')->nullable()` |
-| consumables | supplier_id | `database/migrations/2023_04_12_135822_add_supplier_to_components.php#L23-L24` | `$table->integer('supplier_id')->after('user_id')->nullable()->default(null)` |
-| consumables | manufacturer_id | `database/migrations/2024_10_23_162301_add_manufacturer_id_model_number_to_consumables.php#L15` | `$table->integer('manufacturer_id')->after('purchase_cost')->nullable()->default(null)` |
-| components | supplier_id | `database/migrations/2023_04_12_135822_add_supplier_to_components.php#L17-L19` | `$table->integer('supplier_id')->after('user_id')->nullable()->default(null)` |
-| components | manufacturer_id | `database/migrations/2024_10_23_162301_add_manufacturer_id_model_number_to_consumables.php#L15` | `$table->integer('manufacturer_id')->after('purchase_cost')->nullable()->default(null)` |
+| **consumables** | **supplier_id** | `database/migrations/2023_04_12_135822_add_supplier_to_components.php#L23-L24` | `$table->integer('supplier_id')->after('user_id')->nullable()->default(null)` |
+| **consumables** | **manufacturer_id** | `database/migrations/2016_05_16_164733_add_model_mfg_to_consumable.php#L17` | `$table->integer('manufacturer_id')->nullable()->default(null)` |
+| **components** | **supplier_id** | `database/migrations/2023_04_12_135822_add_supplier_to_components.php#L17-L19` | `$table->integer('supplier_id')->after('user_id')->nullable()->default(null)` |
+| **components** | **manufacturer_id** | `database/migrations/2024_10_23_162301_add_manufacturer_id_model_number_to_consumables.php#L15` | `$table->integer('manufacturer_id')->after('purchase_cost')->nullable()->default(null)` |
 | maintenances | supplier_id | 随表创建 | 仅 `integer` 类型 |
+
+> ⚠️ **迁移文件名与操作对象不一致说明**：
+> - 迁移文件 `database/migrations/2024_10_23_162301_add_manufacturer_id_model_number_to_consumables.php` 的文件名表明目标是 `consumables` 表，但 `up()` 方法的 `Schema::table()` 实际只操作了 `components` 表（第14行），向其添加 `manufacturer_id` 和 `model_number` 字段，**未对 consumables 表执行任何操作**。
+> - `consumables.manufacturer_id` 实际上是在 **2016年5月** 的迁移 `database/migrations/2016_05_16_164733_add_model_mfg_to_consumable.php#L17` 中添加的，与 `model_no` 和 `item_no` 字段同时被引入。
 
 > **范围限定**：以上结论仅适用于 `supplier_id` 和 `manufacturer_id` 字段。项目中 `company_id` 字段的迁移文件曾有注释掉的外键声明（如 `database/migrations/2015_11_05_061115_add_company_id_to_consumables_table.php#L17` 的 `// $table->foreign('company_id')->references('id')->on('companies')`），且在 `database/migrations/2017_10_03_015503_drop_foreign_keys.php` 中有显式删除 `company_id` 外键的操作。
 
