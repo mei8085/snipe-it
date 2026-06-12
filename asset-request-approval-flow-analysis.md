@@ -217,55 +217,192 @@ $this->save();
 
 ---
 
-### 3.2 入口二：提交申请动作
+### 3.2 入口二：提交申请动作（Web 双路径深度对比）
 
-#### Web 端
-- **路由1**：`POST /request-asset/{asset}` → 单资产申请
-- **路由2**：`POST /account/request-item/{itemType}/{itemId}` → 通用申请（资产/模型/配件）
-- **控制器**：[ViewAssetsController::store](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L228-L243) / [getRequestItem](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L164-L221)
-- **中间件**：`web` 组
+Web 端存在**两条完全独立的提交路径**，使用不同的代码逻辑和权限校验，**绝对不是一套门禁**！
 
-**权限校验链（CreateCheckoutRequestAction）：**
+---
+
+#### Web 路径 A：单资产申请入口（store 方法）
+- **路由**：`POST /request-asset/{asset}`
+- **路由名**：`account.request-asset`
+- **控制器方法**：[ViewAssetsController::store](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L228-L243)
+- **参数注入**：通过 Laravel 路由模型绑定自动注入 `Asset $asset`
+- **支持类型**：仅支持单个 `Asset`（资产实例）
+
+**完整执行流程：**
+```php
+public function store(Asset $asset): RedirectResponse
+{
+    try {
+        CreateCheckoutRequestAction::run($asset, auth()->user());
+        return redirect()->route('requestable-assets')->with('success', ...);
+    } catch (AssetNotRequestable $e) {
+        return redirect()->back()->with('error', 'Asset is not requestable');
+    } catch (AuthorizationException $e) {
+        return redirect()->back()->with('error', trans('admin/hardware/message.requests.error'));
+    } catch (Exception $e) {
+        report($e);
+        return redirect()->back()->with('error', trans('general.something_went_wrong'));
+    }
+}
 ```
-1. Auth 中间件 → 登录用户
-2. 资产可申请性校验：
-   is_null(Asset::RequestableAssets()->find($asset->id))
-   → 失败抛出 AssetNotRequestable 异常
-3. 公司权限校验：
-   Company::isCurrentUserHasAccess($asset)
-   → 失败抛出 AuthorizationException 异常
-4. 无 Policy 显式 authorize 调用
+
+**权限校验链（严格模式）：**
+```
+1. Auth 中间件 → 必须登录
+2. 路由模型绑定 → 资产必须存在（404 if not found）
+3. CreateCheckoutRequestAction 内部校验：
+   ├─ 3.1 可申请性校验
+   │    is_null(Asset::RequestableAssets()->find($asset->id))
+   │    → 不满足 → 抛出 AssetNotRequestable 异常
+   │    
+   └─ 3.2 公司权限校验
+        Company::isCurrentUserHasAccess($asset)
+        → 不满足 → 抛出 AuthorizationException 异常
+
+4. 创建 CheckoutRequest 记录
+5. 记录操作日志
+6. 更新 requests_counter
+7. 发送通知邮件
 ```
 
-代码位置：[CreateCheckoutRequestAction.php](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Actions/CheckoutRequests/CreateCheckoutRequestAction.php)
+代码位置：[CreateCheckoutRequestAction.php#L21-L53](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Actions/CheckoutRequests/CreateCheckoutRequestAction.php#L21-L53)
+
+**可申请范围定义（Asset）：**
+```php
+scopeRequestableAssets($query) {
+    return Company::scopeCompanyables(
+        $query->where('assets.requestable', '=', 1)
+    )->join('status_labels AS status_alias', function ($join) {
+        $join->on('status_alias.id', '=', 'assets.status_id')
+            ->where('status_alias.archived', '=', 0)
+            ->where(function ($s) {
+                $s->where('status_alias.deployable', '=', 1)
+                  ->orWhere('status_alias.pending', '=', 1);
+            });
+    });
+}
+```
+代码位置：[Asset.php#L1788-L1803](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Models/Asset.php#L1788-L1803)
+
+---
+
+#### Web 路径 B：通用申请入口（getRequestItem 方法）
+- **路由**：`POST /account/request/{itemType}/{itemId}/{cancel_by_admin?}/{requestingUser?}`
+- **路由名**：`account/request-item`
+- **控制器方法**：[ViewAssetsController::getRequestItem](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L164-L221)
+- **参数注入**：无模型绑定，手动 `call_user_func([$fullItemType, 'find'], $itemId)`
+- **支持类型**：仅支持使用 `Requestable` trait 的模型
+  - `asset` → `App\Models\Asset`
+  - `asset_model` → `App\Models\AssetModel`（内部转换显示名为 `model`）
+
+**完整执行流程：**
+```php
+public function getRequestItem(Request $request, $itemType, $itemId = null, 
+                                $cancel_by_admin = false, $requestingUser = null): RedirectResponse
+{
+    // 1. 动态解析模型类
+    $fullItemType = 'App\\Models\\'.studly_case($itemType);
+    if ($itemType == 'asset_model') { $itemType = 'model'; }
+    
+    // 2. 手动查找实例（无 404 异常！）
+    $item = call_user_func([$fullItemType, 'find'], $itemId);
+    
+    // 3. 记录日志（注意：此时 $item 可能为 null！）
+    $logaction = new Actionlog;
+    $logaction->item_id = $item->id;  // ⚠️ 如果 $item 为 null 会报错！
+    
+    // 4. 检查是否已申请（toggle 逻辑）
+    if (($item_request = $item->isRequestedBy($user)) || $cancel_by_admin) {
+        // 4.1 取消申请路径
+        $item->cancelRequest($requestingUser);  // 无权限校验！
+        $logaction->logaction(ActionType::RequestCanceled);
+        // 发送取消通知...
+        return redirect()->back()->with('success', ...);
+    } else {
+        // 4.2 提交申请路径
+        $item->request();  // 直接调用，无任何校验！
+        $logaction->logaction('requested');
+        // 发送申请通知...
+        return redirect()->route('requestable-assets')->with('success', ...);
+    }
+}
+```
+
+**权限校验链（宽松模式 - 几乎没有校验！）：**
+```
+1. Auth 中间件 → 必须登录
+2. 手动查找 → $item = Model::find($itemId)
+   ⚠️ 找不到不会抛 404，后面访问 $item->id 时会报错
+   
+3. ⚠️ 无显式可申请性校验
+   - 不检查 $item->requestable 字段
+   - 不检查关联状态是否可部署/归档
+   
+4. ⚠️ 无显式公司权限校验
+   - 不调用 Company::isCurrentUserHasAccess()
+   - 依赖 Model 自身是否有全局 CompanyScope
+   
+5. 检查是否已申请（isRequestedBy）
+   → 是 → 执行取消（cancelRequest）
+   → 否 → 执行申请（request）
+   
+6. 直接调用 $item->request() / $item->cancelRequest()
+   ⚠️ Requestable trait 中的方法无任何校验！
+```
+
+**可申请范围对比（按类型）：**
+
+| 类型 | 可申请性定义 | 公司隔离 | 代码位置 |
+|------|-------------|---------|---------|
+| Asset | `scopeRequestableAssets` 严格校验<br>requestable=1 + 状态可部署/待处理 + 未归档 | 有（`Company::scopeCompanyables`） | [Asset.php#L1788-L1803](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Models/Asset.php#L1788-L1803) |
+| AssetModel | `scopeRequestableModels` 宽松校验<br>仅检查 `requestable = 1` | 无（直接 `where('requestable', '1')`） | [AssetModel.php#L314-L317](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Models/AssetModel.php#L314-L317) |
+
+**⚠️ 关键差异**：通用入口申请 AssetModel 时，`scopeRequestableModels` **没有调用 `Company::scopeCompanyables`**，理论上可以跨公司申请其他公司的资产模型！
+
+---
+
+#### 两条 Web 路径核心差异对比表
+
+| 对比维度 | 路径 A：单资产申请（store） | 路径 B：通用申请（getRequestItem） |
+|---------|---------------------------|---------------------------------|
+| 路由 | `POST /request-asset/{asset}` | `POST /account/request/{itemType}/{itemId}` |
+| 模型查找 | 路由模型绑定（自动 404） | 手动 `find()`（无 404） |
+| 支持类型 | 仅 Asset | Asset + AssetModel |
+| 业务逻辑类 | `CreateCheckoutRequestAction` | 直接调用 `$item->request()` |
+| 可申请性校验 | ✅ 严格（RequestableAssets scope） | ❌ 无（直接写入） |
+| 公司权限校验 | ✅ 显式 `isCurrentUserHasAccess` | ❌ 无（依赖模型全局 scope） |
+| 异常处理 | 分类捕获三种异常 | 无 try-catch（直接报错） |
+| 重复申请检查 | Action 内通过 DB 唯一索引 | 方法内 `isRequestedBy()` toggle |
+| 计数更新 | ✅ `increment('requests_counter')` | ❌ 无 |
+| 代码位置 | [ViewAssetsController.php#L228-L243](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L228-L243) | [ViewAssetsController.php#L164-L221](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L164-L221) |
+
+---
 
 #### API 端
 - **路由**：`POST /api/v1/account/request/{asset}`
 - **控制器**：[Api\CheckoutRequest::store](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Api/CheckoutRequest.php#L17-L32)
 - **中间件**：`api` 组
 
-**权限校验链**：**与 Web 端完全相同**（复用同一个 Action 类）
+**权限校验链**：与 Web 路径 A **完全相同**（复用 `CreateCheckoutRequestAction`）
 
 ```
 1. auth:api 中间件 → Token 认证
 2. 调用 CreateCheckoutRequestAction::run()
-   → 完全相同的两步校验
+   → 可申请性校验 + 公司权限校验
 ```
 
-#### Web vs API 差异对比
+#### Web 路径 A vs API 一致性对比
 
-| 对比项 | Web 端 | API 端 |
-|--------|--------|--------|
+| 对比项 | Web 路径 A | API 端 |
+|--------|-----------|--------|
 | 认证方式 | Session + CSRF Token | Bearer Token |
 | 核心业务逻辑 | 完全相同（复用 CreateCheckoutRequestAction） | 完全相同（复用 CreateCheckoutRequestAction） |
 | 可申请性校验 | 有 | 有 |
-| 公司权限校验 | 有（`Company::isCurrentUserHasAccess`） | 有（`Company::isCurrentUserHasAccess`） |
-| 显式 Policy 调用 | 无 | 无 |
-| 异常处理 | 捕获后 Redirect + Session flash | 捕获后 JSON 响应 |
-| 成功响应 | RedirectResponse | JsonResponse |
-| 代码位置 | [ViewAssetsController.php#L228-L243](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L228-L243) | [Api/CheckoutRequest.php#L17-L32](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Api/CheckoutRequest.php#L17-L32) |
-
-**✅ 一致性良好**：提交申请动作 Web/API 复用同一套业务逻辑，权限校验完全一致。
+| 公司权限校验 | 有 | 有 |
+| 计数更新 | 有 | 有 |
+| 响应格式 | RedirectResponse | JsonResponse |
 
 ---
 
@@ -540,13 +677,15 @@ public function before(User $user, $ability, $item)
 | 操作 | 所需权限 | 公司校验 | 代码位置 |
 |------|---------|---------|---------|
 | 查看可申请资产（API） | `assets.view.requestable` | 有 | [AssetPolicy.php#L15-L18](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Policies/AssetPolicy.php#L15-L18) |
-| 查看可申请资产（Web） | 仅需登录（缺陷） | 查询层隐式 | - |
-| 提交申请 | 登录 + 资产可申请 + 同公司 | 有 | [CreateCheckoutRequestAction.php#L23-L28](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Actions/CheckoutRequests/CreateCheckoutRequestAction.php#L23-L28) |
-| 查看待审批列表（管理端） | `assets.view` | 有 | [AssetsController.php#L1104](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L1104) |
-| 查看我的申请（用户端API） | 仅需登录 | 无（数据隔离） | [Api/ProfileController.php#L48-L89](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Api/ProfileController.php#L48-L89) |
-| 执行分配（审批通过） | `assets.checkout` | 有 | [AssetCheckoutController.php#L79](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Assets/AssetCheckoutController.php#L79) |
-| 取消申请 | 登录 + 同公司（缺陷：不校验本人） | 有 | [CancelCheckoutRequestAction.php#L17-L19](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Actions/CheckoutRequests/CancelCheckoutRequestAction.php#L17-L19) |
-| 用户验收 | 分配给本人 + 同公司 | 有 | [AcceptanceController.php#L72-L80](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Account/AcceptanceController.php#L72-L80) |
+| 查看可申请资产（Web） | 仅需登录（缺陷） | 查询层隐式 | [ViewAssetsController.php#L146-L162](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L146-L162) |
+| 提交申请（Web路径A：单资产） | 登录 + 资产可申请 + 同公司 | ✅ 有 | [CreateCheckoutRequestAction.php#L23-L28](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Actions/CheckoutRequests/CreateCheckoutRequestAction.php#L23-L28) |
+| 提交申请（Web路径B：通用-Asset） | 登录 | ❌ 无（依赖模型全局scope） | [ViewAssetsController.php#L164-L221](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L164-L221) |
+| 提交申请（Web路径B：通用-AssetModel） | 登录 | ❌ 无（无公司过滤） | [AssetModel.php#L314-L317](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Models/AssetModel.php#L314-L317) |
+| 查看待审批列表（管理端） | `assets.view` | ❌ 无（类级权限，架构缺陷） | [AssetsController.php#L1102-L1114](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L1102-L1114) |
+| 查看我的申请（用户端API） | 仅需登录 | ✅ 数据天然隔离 | [Api/ProfileController.php#L48-L89](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Api/ProfileController.php#L48-L89) |
+| 执行分配（审批通过） | `assets.checkout` | ✅ 有 | [AssetCheckoutController.php#L79](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Assets/AssetCheckoutController.php#L79) |
+| 取消申请 | 登录 + 同公司（缺陷：不校验本人） | ✅ 有 | [CancelCheckoutRequestAction.php#L17-L19](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Actions/CheckoutRequests/CancelCheckoutRequestAction.php#L17-L19) |
+| 用户验收 | 分配给本人 + 同公司 | ✅ 有 | [AcceptanceController.php#L72-L80](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Account/AcceptanceController.php#L72-L80) |
 
 ---
 
@@ -575,14 +714,19 @@ public function before(User $user, $ability, $item)
 
 ### 7.2 已确认的设计缺陷
 
-| 缺陷描述 | 影响 | 相关代码 |
-|---------|------|---------|
-| checkout 后 CheckoutRequest 状态不更新 | 已分配资产的申请仍显示在待审批列表 | 全代码库无 checkout 后更新逻辑 |
-| `fulfilled_at` 字段定义但未使用 | 状态机不完整，无法区分"已完成"和"待处理" | [迁移文件](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/database/migrations/2018_03_29_053618_add_canceled_at_and_fulfilled_at_in_requests.php) |
-| Web 端可申请列表无权限校验 | 绕过 `assets.view.requestable` 权限控制 | [ViewAssetsController.php#L146-L162](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L146-L162) |
-| API 端我的申请无 canceled_at 过滤 | 已取消的申请仍显示 | [ProfileController.php#L50](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Api/ProfileController.php#L50) |
-| 取消申请不校验是否为本人 | 同公司任意用户可取消他人申请 | [CancelCheckoutRequestAction.php#L17-L19](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Actions/CheckoutRequests/CancelCheckoutRequestAction.php#L17-L19) |
-| 审批与分配强耦合 | 无法"批准申请但暂不分配资产" | 无独立 approve 动作 |
+| 缺陷描述 | 影响程度 | 影响范围 | 相关代码 |
+|---------|---------|---------|---------|
+| checkout 后 CheckoutRequest 状态不更新 | 高 | 管理端待审批列表仍显示已分配的申请 | 全代码库无 checkout 后更新逻辑 |
+| `fulfilled_at` 字段定义但未使用 | 高 | 状态机不完整，无法区分"已完成"和"待处理" | [迁移文件](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/database/migrations/2018_03_29_053618_add_canceled_at_and_fulfilled_at_in_requests.php) |
+| **Web 两条申请路径门禁不一致** | 高 | 通用入口(getRequestItem)无校验，可绕过限制申请任何资产/模型 | [ViewAssetsController.php#L164-L221](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L164-L221) |
+| **管理端待审批列表无实例级公司校验** | 高 | 多公司环境下管理员可看到其他公司的申请 | [AssetsController.php#L1102-L1114](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L1102-L1114) |
+| **通用入口申请 AssetModel 无公司过滤** | 高 | 可跨公司申请其他公司的资产模型 | [AssetModel.php#L314-L317](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Models/AssetModel.php#L314-L317) |
+| Web 端可申请列表无权限校验 | 中 | 绕过 `assets.view.requestable` 权限控制 | [ViewAssetsController.php#L146-L162](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L146-L162) |
+| API 端我的申请无 canceled_at 过滤 | 低 | 已取消的申请仍显示 | [ProfileController.php#L50](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Api/ProfileController.php#L50) |
+| 取消申请不校验是否为本人 | 中 | 同公司任意用户可取消他人申请 | [CancelCheckoutRequestAction.php#L17-L19](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Actions/CheckoutRequests/CancelCheckoutRequestAction.php#L17-L19) |
+| 审批与分配强耦合 | 中 | 无法"批准申请但暂不分配资产" | 无独立 approve 动作 |
+| 通用入口无 404 异常处理 | 低 | 请求不存在的 itemId 会直接报错 | [ViewAssetsController.php#L172](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L172) |
+| 通用入口不更新 requests_counter | 中 | 计数不准确，影响统计 | [Requestable.php#L33-L38](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Models/Traits/Requestable.php#L33-L38) |
 
 ### 7.3 并发与一致性问题
 
