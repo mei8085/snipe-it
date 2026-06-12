@@ -420,14 +420,104 @@ public function getRequestItem(Request $request, $itemType, $itemId = null,
 ```
 1. Auth 中间件 → 登录
 2. 显式权限校验：$this->authorize('index', Asset::class)
-   → 需要 assets.view 权限（管理员权限）
+   → 注意：传递的是类名 Asset::class，不是实例！
 3. 查询过滤：
    CheckoutRequest::with('user', 'requestedItem')
        ->whereNull('canceled_at')    // 只看未取消的
        ->orderBy('created_at', 'desc')
-4. 无显式公司权限校验 → 依赖 SnipePermissionsPolicy::before() 钩子
-   → Company::isCurrentUserHasAccess($item) 校验
+   → ⚠️ 无任何 company_id 过滤条件！
 ```
+
+---
+
+#### 深度分析：为什么 `authorize('index', Asset::class)` 跳过了公司校验？
+
+这是理解管理端待审批列表无公司隔离的**关键**。让我们从 `SnipePermissionsPolicy::before()` 钩子的源码和注释讲起。
+
+**关键源码**：[SnipePermissionsPolicy.php#L38-L73](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Policies/SnipePermissionsPolicy.php#L38-L73)
+
+```php
+public function before(User $user, $ability, $item)
+{
+    // 1. 超级管理员 admin 直接放行
+    if ($user->hasAccess('admin')) {
+        return true;
+    }
+
+    // 2. ⚠️ 关键判断：传类名 vs 传实例
+    // 官方注释原文：
+    // "If we got here by $this->authorize('something', $actualModel) then we can continue on,
+    //  but if we got here via $this->authorize('something', Model::class) then calling
+    //  Company::isCurrentUserHasAccess($item) gets weird."
+    if (! $item instanceof Model) {
+        return;  // ← 返回 null！表示"不做判断，让后续策略方法处理"
+    }
+
+    // 3. 实例级公司权限校验（只有传实例时才会走到这里）
+    if (! Company::isCurrentUserHasAccess($item)) {
+        return false;
+    }
+}
+```
+
+**Laravel Policy `before()` 的返回值语义**：
+
+| 返回值 | 含义 | 后续行为 |
+|--------|------|---------|
+| `true` | 允许 | 直接返回 true，不再执行后续策略方法 |
+| `false` | 拒绝 | 直接返回 false，不再执行后续策略方法 |
+| `null`（无 return 或 return;） | **不做判断** | **继续执行后续的 index()/view()/update() 等方法** |
+
+**完整执行链路分析**：
+
+```
+$this->authorize('index', Asset::class)
+        │
+        ▼
+AssetPolicy::before() [继承自 SnipePermissionsPolicy]
+        │
+        ├─ 检查 user->hasAccess('admin') → false（非超级管理员）
+        │
+        ├─ 检查 $item instanceof Model
+        │     Asset::class 是字符串类名，不是 Model 实例
+        │     → 条件成立！
+        │     → return null（不做判断）
+        │
+        ▼
+AssetPolicy::index() [继承自 SnipePermissionsPolicy]
+        │
+        ▼
+return $user->hasAccess('assets.view');
+        │
+        ▼
+   仅检查权限字符串，不检查公司！
+```
+
+**架构设计意图（从源码注释推断）**：
+
+Snipe-IT 的公司权限采用**两层架构**，每层职责不同：
+
+| 层级 | 机制 | 适用场景 | 说明 |
+|------|------|---------|------|
+| **L1 模型层** | `CompanyableTrait` + `CompanyableScope` 全局 Scope | 列表查询（index/view） | 注释原文："That scoping happens on the model level (except for the Users model) via the Companyable trait." |
+| **L2 策略层** | `SnipePermissionsPolicy::before()` 中的 `Company::isCurrentUserHasAccess()` | 单个实例操作（update/delete/checkout） | 对具体 Model 实例做实例级公司校验 |
+
+设计预期：
+- 对于 `Asset::all()`、`Asset::find()` 等列表查询，靠 **L1 全局 Scope** 自动加 `where company_id = X` 过滤
+- 对于 `authorize('update', $assetInstance)` 等单实例操作，靠 **L2 Policy before** 做实例级校验
+
+**问题出在哪里？—— CheckoutRequest 缺少 L1 全局 Scope**：
+
+CheckoutRequest 模型 **没有使用 `CompanyableTrait`**，因此：
+1. CheckoutRequest 表查询不会自动加 `where company_id = ?`
+2. `CheckoutRequest::with('user', 'requestedItem')` 中的主查询无公司过滤
+3. 仅关联的 `requestedItem` 如果是 Asset 类型，会被其自身的全局 Scope 过滤（可能导致关联加载为 null）
+
+**最终效果**：
+- 非超级管理员但有 `assets.view` 权限的用户，可以看到**所有公司**用户提交的 CheckoutRequest 申请记录
+- 但查看关联的具体资产时，跨公司的资产可能因全局 Scope 过滤而显示为 null（数据不一致）
+
+---
 
 #### API 端（普通用户视角）
 - **路由**：`GET /api/v1/account/requests`
