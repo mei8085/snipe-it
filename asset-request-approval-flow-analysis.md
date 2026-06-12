@@ -542,10 +542,10 @@ CheckoutRequest 模型 **没有使用 `CompanyableTrait`**，因此：
 | 使用角色 | 管理员 | 普通用户 |
 | 数据范围 | 所有用户的申请 | 仅当前用户的申请 |
 | 所需权限 | `assets.view` | 仅需登录 |
-| 显式 Policy 校验 | 有（`AssetPolicy::index`） | 无 |
-| 公司权限校验 | 有（Policy before 钩子） | 无（数据天然隔离） |
+| 显式 Policy 校验 | 有（`AssetPolicy::index`，传类名 `Asset::class`） | 无 |
+| 公司权限校验 | ❌ **无**（类级权限 `authorize('index', Asset::class)` 只检查 `assets.view`，不触发实例级公司校验；且 CheckoutRequest 无全局 Scope） | 无（`where user_id = auth()->id()` 天然隔离） |
 | canceled_at 过滤 | 有（`whereNull('canceled_at')`） | **无**（已取消的也显示） |
-| 查询过滤条件 | 无用户过滤 | `where('user_id', auth()->id())` |
+| 查询过滤条件 | 无用户过滤，无公司过滤 | `where('user_id', auth()->id())` |
 | 代码位置 | [AssetsController.php#L1102-L1114](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L1102-L1114) | [Api/ProfileController.php#L48-L89](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Api/ProfileController.php#L48-L89) |
 
 **⚠️ 不一致问题**：API 端缺少 `canceled_at` 过滤，用户已取消的申请仍然会显示在"我的申请"列表中。
@@ -804,19 +804,27 @@ public function before(User $user, $ability, $item)
 
 ### 7.2 已确认的设计缺陷
 
-| 缺陷描述 | 影响程度 | 影响范围 | 相关代码 |
-|---------|---------|---------|---------|
-| checkout 后 CheckoutRequest 状态不更新 | 高 | 管理端待审批列表仍显示已分配的申请 | 全代码库无 checkout 后更新逻辑 |
-| `fulfilled_at` 字段定义但未使用 | 高 | 状态机不完整，无法区分"已完成"和"待处理" | [迁移文件](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/database/migrations/2018_03_29_053618_add_canceled_at_and_fulfilled_at_in_requests.php) |
-| **Web 两条申请路径门禁不一致** | 高 | 通用入口(getRequestItem)无校验，可绕过限制申请任何资产/模型 | [ViewAssetsController.php#L164-L221](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L164-L221) |
-| **管理端待审批列表无实例级公司校验** | 高 | 多公司环境下管理员可看到其他公司的申请 | [AssetsController.php#L1102-L1114](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L1102-L1114) |
-| **通用入口申请 AssetModel 无公司过滤** | 高 | 可跨公司申请其他公司的资产模型 | [AssetModel.php#L314-L317](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Models/AssetModel.php#L314-L317) |
-| Web 端可申请列表无权限校验 | 中 | 绕过 `assets.view.requestable` 权限控制 | [ViewAssetsController.php#L146-L162](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L146-L162) |
-| API 端我的申请无 canceled_at 过滤 | 低 | 已取消的申请仍显示 | [ProfileController.php#L50](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Api/ProfileController.php#L50) |
-| 取消申请不校验是否为本人 | 中 | 同公司任意用户可取消他人申请 | [CancelCheckoutRequestAction.php#L17-L19](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Actions/CheckoutRequests/CancelCheckoutRequestAction.php#L17-L19) |
-| 审批与分配强耦合 | 中 | 无法"批准申请但暂不分配资产" | 无独立 approve 动作 |
-| 通用入口无 404 异常处理 | 低 | 请求不存在的 itemId 会直接报错 | [ViewAssetsController.php#L172](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L172) |
-| 通用入口不更新 requests_counter | 中 | 计数不准确，影响统计 | [Requestable.php#L33-L38](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Models/Traits/Requestable.php#L33-L38) |
+| # | 缺陷描述 | 影响程度 | 影响范围 | 绕过的防护层级 | 相关代码 |
+|---|---------|---------|---------|--------------|---------|
+| D1 | checkout 后 CheckoutRequest 状态不更新 | 高 | 管理端待审批列表仍显示已分配的申请 | N/A（状态流转逻辑缺失） | 全代码库无 checkout 后更新逻辑 |
+| D2 | `fulfilled_at` 字段定义但未使用 | 高 | 状态机不完整，无法区分"已完成"和"待处理" | N/A（状态流转逻辑缺失） | [迁移文件](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/database/migrations/2018_03_29_053618_add_canceled_at_and_fulfilled_at_in_requests.php) |
+| D3 | **通用入口申请 AssetModel 三层防护全缺失** | 高 | 可跨公司申请其他公司的资产模型；可申请 `requestable=0` 的模型 | L1（无 Policy）+ L2（无业务校验）+ **L3（无全局 Scope）** | [AssetModel.php#L28-L30](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Models/AssetModel.php#L28-L30) |
+| D4 | **管理端待审批列表无实例级公司校验** | 高 | 多公司环境下有 `assets.view` 权限的管理员可看到其他公司的申请 | L2（类级传参触发 `before()` 返回 null）+ **L3（CheckoutRequest 无全局 Scope）** | [AssetsController.php#L1102-L1114](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L1102-L1114) |
+| D5 | 通用入口申请 Asset 绕过 L1/L2 业务校验 | 中 | 可申请 `requestable=0`、已归档、不可部署的资产；不更新计数 | L1（无 Policy）+ L2（无业务校验） | [ViewAssetsController.php#L164-L221](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L164-L221) |
+| D6 | Web 端可申请列表无权限校验 | 中 | 绕过 `assets.view.requestable` 权限控制 | L1（无 Policy 调用） | [ViewAssetsController.php#L146-L162](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L146-L162) |
+| D7 | 取消申请不校验是否为本人 | 中 | 同公司任意用户可取消他人申请 | L2（缺少申请人身份校验） | [CancelCheckoutRequestAction.php#L17-L19](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Actions/CheckoutRequests/CancelCheckoutRequestAction.php#L17-L19) |
+| D8 | 通用入口不更新 requests_counter | 中 | 申请计数不准确，影响统计 | L2（缺少计数更新逻辑） | [Requestable.php#L33-L38](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Models/Traits/Requestable.php#L33-L38) |
+| D9 | 审批与分配强耦合 | 中 | 无法"批准申请但暂不分配资产" | N/A（架构设计缺陷） | 无独立 approve 动作 |
+| D10 | API 端我的申请无 canceled_at 过滤 | 低 | 已取消的申请仍显示在用户"我的申请"列表 | L2（缺少状态过滤） | [ProfileController.php#L50](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/Api/ProfileController.php#L50) |
+| D11 | 通用入口无 404 异常处理 | 低 | 请求不存在的 itemId 会直接报 TypeError | L2（缺少存在性校验） | [ViewAssetsController.php#L172](file:///d:/fz/0601-1/solo-dogfeeding/code/41-snipe-it/app/Http/Controllers/ViewAssetsController.php#L172) |
+
+**高风险缺陷解读（按风险严重度排序）**：
+
+| 缺陷 | 为什么是高危 | 根因 |
+|------|------------|------|
+| **D3：AssetModel 三层全缺** | 公司隔离完全失效，任何登录用户可跨公司申请其他公司的资产模型 | AssetModel 模型 `use` 语句中缺失 `CompanyableTrait` |
+| **D4：管理端列表无公司过滤** | 多公司环境数据泄露，有 `assets.view` 权限即可看全公司申请 | ① CheckoutRequest 表无 `company_id` 字段 ② 模型无 `CompanyableTrait` ③ `authorize('index', Asset::class)` 传类名触发 `before()` 返回 null |
+| **D1/D2：状态流转缺失** | 已分配的申请仍然出现在待审批列表，管理员重复操作 | 架构上 Checkout 与 CheckoutRequest 完全解耦，无事件监听更新申请状态 |
 
 ### 7.3 并发与一致性问题
 
