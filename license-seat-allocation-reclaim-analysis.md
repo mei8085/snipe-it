@@ -504,29 +504,126 @@ $licenseSeat->save();
 
 > ⚠️ **注意**：Web UI 的指定席位分配路径不检查 `unreassignable_seat`，也不检查席位是否已分配。这与 API 端的 `LicenseSeatsController::update()` 不同——API 端有明确的 `unreassignable_seat` 守卫。
 
-### 10.3 API 端指定席位更新的边界判断
+### 10.3 API 端席位更新的边界判断
 
 **入口**：`PUT /api/licenses/{licenseId}/seats/{seatId}`  
 **控制器**：[LicenseSeatsController::update()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Api/LicenseSeatsController.php#L101-L248)
 
-API 端的判断更严格：
+#### 10.3.1 `isDirty` 与 `$is_checkin` 的判断内容及边界含义
+
+API 端通过 `isDirty()` 和 `$is_checkin` 两个变量完成归属变更的分支路由。它们判断的**是"本次请求带来了什么变化"**，而非"席位原先处于什么状态"。
+
+**`$assignmentTouched`（第 182 行）** — [字段是否被触及](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Api/LicenseSeatsController.php#L180-L183)
 
 ```php
-// 不可再分配的席位，禁止任何归属变更
-if ($assignmentTouched && $licenseSeat->unreassignable_seat) {
-    return response()->json(Helper::formatStandardApiResponse('error', null, 
-        trans('admin/licenses/message.checkout.unavailable')));
-}
+$assignmentTouched = $licenseSeat->isDirty('assigned_to') || $licenseSeat->isDirty('asset_id');
 ```
 
-| 检查项 | Web UI 指定席位 | API 指定席位更新 |
-|--------|----------------|-----------------|
-| 席位存在 | ✅ | ✅ |
-| 席位属于该 license | ✅ | ✅ |
-| 席位已被分配 | ❌ 不检查 | ✅ （通过 isDirty 判断是否为变更操作，但允许覆盖） |
-| 不可再分配标记 | ❌ 不检查 | ✅ **有守卫，拒绝变更** |
-| 事务保护 | ❌ | ✅ DB::transaction |
-| FMCS 公司隔离 | ❌ （Web 端另有全局中间件） | ✅ 显式校验 |
+| 维度 | 说明 |
+|------|------|
+| 判断对象 | `fill($validated)` 后模型的脏字段检测 |
+| 判断内容 | 本次请求是否使 `assigned_to` 或 `asset_id` 的值发生了变更 |
+| 不等于 | ❌ 不等于"席位原先是否已被分配"。`isDirty` 比较的是「新值 vs 原值」，而不是「原值是否非空」 |
+| 典型场景 | 席位原先 `assigned_to = 5`，请求传入 `assigned_to = 10` → `isDirty = true`（归属变更，但原先已分配） |
+| 等值场景 | 席位原先 `assigned_to = 5`，请求传入 `assigned_to = 5` → `isDirty = false`（未触及归属字段） |
+
+**`$is_checkin`（第 195 行）** — [是否是回收操作](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Api/LicenseSeatsController.php#L194-L195)
+
+```php
+$is_checkin = ($assignmentTouched && $licenseSeat->assigned_to === null && $licenseSeat->asset_id === null);
+```
+
+| 维度 | 说明 |
+|------|------|
+| 判断对象 | `fill` 后模型上的**当前值**（即写入数据库后的最终状态） |
+| 判断内容 | 归属字段变更后，两个归属字段是否**都变成了 null** |
+| 不等于 | ❌ 不等于"席位原先是否空闲"。它只看操作结果，不看操作前状态 |
+| 典型场景 | 席位原先 `assigned_to = 5, asset_id = null`，请求传入 `assigned_to = null` → `$is_checkin = true` |
+| 非回收场景 | 席位原先 `assigned_to = null`，请求传入 `assigned_to = 10` → `$is_checkin = false`（这是分配操作） |
+| 覆盖场景 | 席位原先 `assigned_to = 5`，请求传入 `assigned_to = 10` → `$is_checkin = false`（这是转派操作，按分配分支处理） |
+
+**核心结论**：`isDirty` 和 `$is_checkin` 的判断维度是"**变更方向**"（值是否改变了？改变后朝哪个方向？），而不是"**起始状态**"（席位原先是否被分配？）。因此：
+
+1. **API 端不检查席位原先是否已被分配**——无论原值是 null 还是非空，只要新值不同且非空，就按分配（checkout）分支处理。
+2. **API 端不拒绝覆盖既有归属**——原先 `assigned_to = 5` 被改为 `assigned_to = 10` 时，`isDirty = true` 且 `$is_checkin = false`，走 `logCheckout` 分支，原归属被静默替换。
+3. **这两个判断的实际用途**是决定日志类型（`logCheckin` vs `logCheckout`）以及是否需要在回收后冻结席位，而非守卫既有归属。
+
+#### 10.3.2 完整流程与守卫位置
+
+```
+请求进入
+  │
+  ├─ 1. 参数校验（prohibits 互斥规则、实体存在性）
+  ├─ 2. authorize('checkout', License::class)
+  ├─ 3. LicenseSeat::find($seatId)                → 不存在则错误返回
+  ├─ 4. 校验 license 归属                         → 不匹配则错误返回
+  ├─ 5. FMCS 公司隔离校验                         → 目标用户/资产与 license 同公司
+  ├─ 6. fill($validated)                          → 新值写入模型（尚未持久化）
+  ├─ 7. $anythingTouched ?                        → 无变更则直接成功返回
+  ├─ 8. $assignmentTouched && unreassignable_seat  ← 【席位级不可再分配守卫】
+  │     └─ 是 → 返回 "checkout.unavailable" 错误
+  ├─ 9. 计算 $is_checkin、$target
+  └─ 10. DB::transaction {
+           save()                                  ← 直接写入新值，覆盖原值
+           if ($assignmentTouched) {
+             if ($is_checkin) {
+               if (!license->reassignable)
+                 unreassignable_seat = true; save()  ← 回收后冻结
+               logCheckin($target, $notes)
+             } else {
+               logCheckout($notes, $target)          ← 分配/转派日志
+             }
+           }
+         }
+```
+
+#### 10.3.3 Web 端指定席位 vs API 端更新：三大核心差异
+
+**差异一：既有归属的处理**
+
+两者在处理既有归属时的行为**一致**——都不检查席位原先是否已被分配，都允许静默覆盖。
+
+| 场景 | Web 端指定席位 | API 端更新 |
+|------|---------------|-----------|
+| 席位原先已分配给用户 A，请求分配给用户 B | `assigned_to` 直接从 A 覆盖为 B | 同左：`isDirty = true`, `$is_checkin = false`, 走 `logCheckout` 分支 |
+| 席位原先空闲，请求分配给用户 A | `assigned_to` 从 null 写入 A | 同左：`isDirty = true`, `$is_checkin = false`, 走 `logCheckout` 分支 |
+| 是否拒绝覆盖既有归属 | ❌ 不拒绝 | ❌ 不拒绝 |
+
+**差异二：整体余量守卫**
+
+| 维度 | Web 端指定席位 | API 端更新 |
+|------|---------------|-----------|
+| 是否检查许可证整体余量 | ✅ 是（[第 88 行](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckoutController.php#L88) `availCount()->count() < 1`） | ❌ 否 |
+| 守卫时机 | 在获取席位**之前**执行（先于 `findLicenseSeatToCheckout`） | — |
+| 效果 | 即使指定了空闲席位，若许可证整体余量为 0 也会被拒绝 | 无此守卫，即使整体余量为 0 也可通过指定席位完成转派或分配 |
+| 适用场景 | 防止在无余量时进行新增分配 | 允许转派（A→B，余量不变）和指定空闲席位分配 |
+
+**差异三：不可再分配守卫**
+
+| 维度 | Web 端指定席位 | API 端更新 |
+|------|---------------|-----------|
+| 是否有 `unreassignable_seat` 守卫 | ❌ 无 | ✅ 有，但**仅当归属字段被变更时触发** |
+| 守卫位置 | — | [第 190-192 行](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Api/LicenseSeatsController.php#L190-L192) |
+| 守卫条件 | — | `$assignmentTouched && $licenseSeat->unreassignable_seat` |
+| 只改 `notes` 时的行为 | 不适用（Web checkout 不支持仅改 notes） | 不触发守卫，`unreassignable_seat = true` 的席位仍可修改 `notes` |
+| 指定冻结席位分配时的行为 | ❌ **可成功分配**（无守卫） | ❌ **被拒绝**（守卫触发，返回 `checkout.unavailable`） |
+
+#### 10.3.4 完整对比表
+
+| 维度 | Web 端 `POST /licenses/{id}/checkout/{seatId}` | API 端 `PUT /api/licenses/{id}/seats/{seatId}` |
+|------|------------------------------------------------|-------------------------------------------------|
+| **操作语义** | 纯「分配」操作（checkout） | 通用「更新」操作（可分配、可回收、可仅改 notes） |
+| **席位原先是否已分配** | ❌ 不检查，允许覆盖 | ❌ 不检查，允许覆盖 |
+| **许可证整体余量守卫** | ✅ 有（`availCount() < 1`，获取席位前执行） | ❌ 无 |
+| **席位级 `unreassignable_seat` 守卫** | ❌ 无 | ✅ 有（仅当 `$assignmentTouched = true` 时触发） |
+| **覆盖既有归属后的日志** | `event(CheckoutableCheckedOut)` → Listener | 事务内 `logCheckout($notes, $target)` |
+| **回收功能** | ❌ 不支持（需走单独 checkin 路由） | ✅ 支持（传 `assigned_to = null` / `asset_id = null`） |
+| **回收后冻结席位** | ✅ checkin 控制器中处理 | ✅ update 事务内处理 |
+| **仅修改 notes** | ❌ 不支持（该接口专门用于 checkout） | ✅ 支持（`$assignmentTouched = false` 时不触发守卫） |
+| **FMCS 公司隔离** | ❌ 不显式检查（依赖全局中间件） | ✅ 显式校验目标实体与 license 同公司 |
+| **事务保护** | ❌ 无（save 与 event 分离） | ✅ `DB::transaction` 包裹 save + log |
+| **assigned_to / asset_id 互斥** | ✅ Web 端表单逻辑只允许选一种 | ✅ `prohibits` 校验规则 |
+| **分配给资产时自动关联用户** | ✅ `checkoutToAsset()` 内处理 | ❌ 不自动处理（API 调用方自行决定） |
 
 ### 10.4 预定义套件分配路径的边界判断
 
