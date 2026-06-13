@@ -40,9 +40,25 @@ Snipe-IT **没有**在 `licenses` 表上维护一个 `remaining_seats` 计数字
 | `availCount()` | [License.php#L631-L638](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L631-L638) | 查询 `assigned_to IS NULL AND asset_id IS NULL AND unreassignable_seat = false AND deleted_at IS NULL` | `Relation`（可 count） |
 | `getAvailSeatsCountAttribute()` | [License.php#L668-L675](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L668-L675) | 对 `availCount()` 取聚合 count | `int` |
 | `freeSeat()` | [License.php#L806-L817](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L806-L817) | `availCount()` 条件 + `orderBy('id','asc')->first()` | `LicenseSeat\|null` |
-| `freeSeats()` | [License.php#L828-L831](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L828-L831) | `whereNull('assigned_to')->whereNull('deleted_at')->whereNull('asset_id')` | `Relation` |
+| `freeSeats()`（关系） | [License.php#L828-L831](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L828-L831) | `whereNull('assigned_to')->whereNull('deleted_at')->whereNull('asset_id')` **⚠ 不检查 `unreassignable_seat`** | `Relation`（hasMany） |
 | `getFreeSeatCountAttribute()` | [License.php#L393-L396](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L393-L396) | 委托给 `remaincount()`，作为 `$appends` 属性暴露 | `int` |
 | `percentRemaining()` | [License.php#L465-L476](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L465-L476) | `(可用席位数 / 总席位数) * 100` | `float` |
+
+### 2.2 `freeSeat()` 与 `freeSeats()` 的关键差异
+
+这是容易混淆的两个方法，也是边界问题的根源之一：
+
+| 维度 | `freeSeat()`（方法） | `freeSeats()`（关系） |
+|------|---------------------|-----------------------|
+| 返回值 | 单条 `LicenseSeat\|null` | `HasMany` 关系（多条） |
+| `assigned_to IS NULL` | ✅ 是 | ✅ 是 |
+| `asset_id IS NULL` | ✅ 是 | ✅ 是 |
+| `deleted_at IS NULL` | ✅ 是 | ✅ 是 |
+| `unreassignable_seat = false` | ✅ **是** | ❌ **否（缺漏）** |
+| 排序 | `ORDER BY id ASC` | 无排序 |
+| 主要使用方 | Web checkout、批量 checkout、CLI checkout | **预定义套件 checkout** |
+
+**结论**：`freeSeats()` 关系缺漏了 `unreassignable_seat = false` 条件，因此通过它获取的"空闲"席位可能包含已被标记为不可再分配的席位。这会导致预定义套件分配路径与其他路径在边界判断上不一致。
 
 **`remaincount()` 的核心公式：**
 
@@ -389,3 +405,213 @@ if (static::class == LicenseSeat::class) {
 | 套件分配 | Kit checkout flow | PredefinedKitCheckoutService::checkout() | ✅ DB::transaction |
 | 席位总量调整 | License 创建/更新 | License::boot() → adjustSeatCount() | ✅ 分块事务 |
 | 批量删除许可证 | `POST /licenses/bulk/delete` | BulkLicensesController::destroy() | ❌ 无（但有守卫） |
+
+---
+
+## 10. 指定席位与预定义套件的边界深度分析
+
+本章深入分析两条特殊分配路径的边界判断逻辑，并对比 `unreassignable_seat` 在各路径中的阻碍作用差异。
+
+### 10.1 指定席位分配路径的边界判断
+
+**入口路由**：`POST /licenses/{licenseId}/checkout/{seatId}`  
+**核心方法**：[findLicenseSeatToCheckout()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckoutController.php#L159-L176)
+
+#### 10.1.1 执行流程
+
+```
+用户传入 seatId
+  │
+  ├─ 1. LicenseSeat::find($seatId)        ← 直接通过 ID 查找席位
+  │
+  ├─ 2. 席位不存在？
+  │     └─ 是 → 报错 "checkout.unavailable"
+  │
+  ├─ 3. 席位所属 license != 当前 license？
+  │     └─ 是 → 报错 "checkout.mismatch"
+  │
+  ├─ 4. checkoutToUser() / checkoutToAsset()
+  │     ├─ 直接写入 assigned_to / asset_id
+  │     └─ save()
+  │
+  └─ 5. event(CheckoutableCheckedOut)
+```
+
+#### 10.1.2 条件判断的详单
+
+在指定席位路径中，**做了哪些检查**、**没做哪些检查**：
+
+| 检查项 | 是否检查 | 代码位置 |
+|--------|---------|----------|
+| 席位是否存在 | ✅ 是 | `LicenseSeat::find($seatId)` |
+| 席位是否属于该许可证 | ✅ 是 | `$licenseSeat->license->is($license)` |
+| 许可证整体余量是否 > 0 | ✅ 是 | `availCount()->count() < 1`（store 入口守卫） |
+| 许可证是否过期/终止 | ✅ 是 | `isInactive()` |
+| **席位是否已被分配** | ❌ **否** | （不检查 `assigned_to`/`asset_id` 是否非空） |
+| **席位是否不可再分配** | ❌ **否** | （不检查 `unreassignable_seat`） |
+| 用户权限（checkout） | ✅ 是 | `authorize('checkout', $license)` |
+
+**关键发现**：当通过 `seatId` 指定席位时，控制器只验证席位"存在且属于该许可证"，**不验证该席位当前是否空闲、是否已被标记为不可再分配**。这意味着：
+
+- 如果传入一个**已被分配**的席位 ID，`assigned_to` / `asset_id` 会被**直接覆盖**，原有归属关系被静默替换。
+- 如果传入一个 `unreassignable_seat = true` 的席位 ID，依然可以成功分配，**`unreassignable_seat` 标记不会阻碍分配**。
+
+这与自由分配路径（`freeSeat()`）形成鲜明对比——`freeSeat()` 会严格过滤掉已分配和不可再分配的席位。
+
+### 10.2 指定席位分配时归属关系的修改机制
+
+当指定 `seatId` 进行分配时，归属字段的修改方式如下：
+
+#### 10.2.1 分配给用户（checkoutToUser）
+
+**方法**：[checkoutToUser()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckoutController.php#L198-L213)
+
+```php
+$licenseSeat->assigned_to = request('assigned_to');
+$licenseSeat->save();
+```
+
+- 直接覆盖 `assigned_to` 字段。
+- `asset_id` 字段保持不变（如果之前有值则保留）。
+- 不做任何"是否已分配"的校验。
+
+#### 10.2.2 分配给资产（checkoutToAsset）
+
+**方法**：[checkoutToAsset()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckoutController.php#L178-L196)
+
+```php
+$licenseSeat->asset_id = request('asset_id');
+
+// Override asset's assigned user if available
+if ($target->checkedOutToUser()) {
+    $licenseSeat->assigned_to = $target->assigned_to;
+}
+$licenseSeat->save();
+```
+
+- 设置 `asset_id` 为目标资产 ID。
+- **特殊覆盖逻辑**：如果目标资产当前已被分配给某个用户（`checkedOutToUser()`），则自动将 `assigned_to` 也设为该资产的当前持有人。
+- 这意味着"分配给资产"可能同时写入两个归属字段。
+
+#### 10.2.3 归属修改的行为对比
+
+| 分配目标 | `assigned_to` 变化 | `asset_id` 变化 | 备注 |
+|----------|-------------------|-----------------|------|
+| 用户（自由分配） | 设为目标用户 ID | 保持不变 | 席位原先是空闲的 |
+| 用户（指定席位） | **直接覆盖**为目标用户 ID | **保留原值** | 原归属用户被静默替换 |
+| 资产（自由分配） | 可能设为资产持有人 | 设为目标资产 ID | 席位原先是空闲的 |
+| 资产（指定席位） | 可能被**覆盖**为资产持有人 | **直接覆盖**为目标资产 ID | 原归属被静默替换 |
+
+> ⚠️ **注意**：Web UI 的指定席位分配路径不检查 `unreassignable_seat`，也不检查席位是否已分配。这与 API 端的 `LicenseSeatsController::update()` 不同——API 端有明确的 `unreassignable_seat` 守卫。
+
+### 10.3 API 端指定席位更新的边界判断
+
+**入口**：`PUT /api/licenses/{licenseId}/seats/{seatId}`  
+**控制器**：[LicenseSeatsController::update()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Api/LicenseSeatsController.php#L101-L248)
+
+API 端的判断更严格：
+
+```php
+// 不可再分配的席位，禁止任何归属变更
+if ($assignmentTouched && $licenseSeat->unreassignable_seat) {
+    return response()->json(Helper::formatStandardApiResponse('error', null, 
+        trans('admin/licenses/message.checkout.unavailable')));
+}
+```
+
+| 检查项 | Web UI 指定席位 | API 指定席位更新 |
+|--------|----------------|-----------------|
+| 席位存在 | ✅ | ✅ |
+| 席位属于该 license | ✅ | ✅ |
+| 席位已被分配 | ❌ 不检查 | ✅ （通过 isDirty 判断是否为变更操作，但允许覆盖） |
+| 不可再分配标记 | ❌ 不检查 | ✅ **有守卫，拒绝变更** |
+| 事务保护 | ❌ | ✅ DB::transaction |
+| FMCS 公司隔离 | ❌ （Web 端另有全局中间件） | ✅ 显式校验 |
+
+### 10.4 预定义套件分配路径的边界判断
+
+**服务类**：[PredefinedKitCheckoutService](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Services/PredefinedKitCheckoutService.php)
+
+#### 10.4.1 席位选取逻辑
+
+**[getLicenseSeatsToAdd()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Services/PredefinedKitCheckoutService.php#L103-L120)**
+
+```php
+$licenses = $kit->licenses()->with('freeSeats')->get();
+foreach ($licenses as $license) {
+    $quantity = $license->pivot->quantity;
+    if ($quantity > count($license->freeSeats)) {
+        $errors[] = trans('admin/kits/general.none_licenses', [...]);
+    }
+    for ($i = 0; $i < $quantity; $i++) {
+        $seats_to_add[] = $license->freeSeats[$i];
+    }
+}
+```
+
+**关键要点**：
+1. 使用 `with('freeSeats')` 预加载关联关系。
+2. 使用 `count($license->freeSeats)` 判断余量是否充足。
+3. 取前 N 个 `freeSeats` 作为待分配席位。
+4. `freeSeats` 关系**不检查** `unreassignable_seat = false`。
+
+#### 10.4.2 实际分配逻辑
+
+**[saveToDb()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Services/PredefinedKitCheckoutService.php#L146-L194)**
+
+```php
+foreach ($license_seats_to_add as $licenseSeat) {
+    $licenseSeat->created_by = $admin->id;
+    $licenseSeat->assigned_to = $user->id;
+    if ($licenseSeat->save()) {
+        event(new CheckoutableCheckedOut($licenseSeat, $user, $admin, $note));
+    } else {
+        $errors[] = 'Something went wrong saving a license seat';
+    }
+}
+```
+
+整个 saveToDb 被包裹在 `DB::transaction` 中，具有事务原子性。
+
+#### 10.4.3 边界判断详单
+
+| 检查项 | 预定义套件路径 |
+|--------|---------------|
+| 套件中 license 的 freeSeats 数量 ≥ pivot.quantity | ✅ 是 |
+| 席位 `assigned_to IS NULL` | ✅ 是（通过 freeSeats 关系） |
+| 席位 `asset_id IS NULL` | ✅ 是（通过 freeSeats 关系） |
+| 席位 `deleted_at IS NULL` | ✅ 是（通过 freeSeats 关系） |
+| **席位 `unreassignable_seat = false`** | ❌ **否（freeSeats 关系缺漏）** |
+| 事务保护 | ✅ 是（DB::transaction） |
+| 用户权限 | ✅ 是（AuthorizesRequests） |
+
+**边界问题**：如果一个许可证的某些席位被标记为 `unreassignable_seat = true`（因回收不可再分配许可证而冻结），这些席位仍然会出现在 `freeSeats` 结果集中。预定义套件在做余量判断和席位选取时，会把这些"冻结"席位当作可用席位。
+
+**实际影响**：
+- 假设某许可证有 10 个席位，其中 5 个已分配，3 个被冻结（`unreassignable_seat = true`），2 个真正可用。
+- 通过 `freeSeats` 计数会得到 5（3 冻结 + 2 可用）。
+- 套件请求 4 个席位：`count($freeSeats) = 5 ≥ 4`，余量判断通过。
+- 但实际分配时，取到的前 4 个席位可能包含被冻结的席位。
+- 冻结席位被分配后，"是否可分配"的语义上出现不一致——该席位本应永久不可再分配。
+
+### 10.5 `unreassignable_seat` 在各路径中的阻碍作用总览
+
+| 操作路径 | `unreassignable_seat = true` 是否阻碍分配 | 依据 |
+|----------|-------------------------------------------|------|
+| Web UI 自由分配（`freeSeat()`） | ✅ **阻碍** | freeSeat 方法包含 `where('unreassignable_seat', '=', false)` |
+| Web UI 指定席位（`seatId`） | ❌ **不阻碍** | findLicenseSeatToCheckout 不检查该字段 |
+| Web 批量分配（`freeSeat()`） | ✅ **阻碍** | 使用 freeSeat 方法 |
+| CLI 批量分配（`freeSeat()`） | ✅ **阻碍** | 使用 freeSeat 方法 |
+| API 席位更新 | ✅ **阻碍** | 显式判断 `$licenseSeat->unreassignable_seat` 并返回错误 |
+| 预定义套件分配（`freeSeats`） | ❌ **不阻碍** | freeSeats 关系不包含该条件 |
+| 席位总量调整（减少时） | ❌ **不阻碍** | adjustSeatCount 只看 assigned_to 和 asset_id 是否为 null |
+
+### 10.6 一致性差异汇总
+
+1. **`freeSeat()` vs `freeSeats()`**：前者是查询构造器方法，包含完整的可用性检查；后者是 Eloquent 关系定义，缺漏了 `unreassignable_seat` 条件。两者名称相近但语义不同，是潜在的一致性风险源。
+
+2. **Web UI vs API**：Web UI 指定席位路径缺少 `unreassignable_seat` 守卫，也缺少事务保护；API 端则两者都有。同一业务操作在不同接口上表现不一致。
+
+3. **指定席位的静默覆盖**：Web UI 指定席位分配时，不会检查席位是否已被分配，直接写入新归属值。这允许"转派"操作，但没有任何确认或日志特殊标记，原有归属关系被静默替换。
+
+4. **分配给资产的附带归属**：`checkoutToAsset()` 中，如果资产当前有分配用户，会自动把 `assigned_to` 也设为该用户。这是一个隐式的双归属赋值，调用方可能没有意识到会同时修改两个字段。
