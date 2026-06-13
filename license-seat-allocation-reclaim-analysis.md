@@ -1,0 +1,391 @@
+# Snipe-IT 软件许可席位分配与回收——可用余量与归属关系同步维护链路分析
+
+## 1. 数据模型概览
+
+### 1.1 核心表结构
+
+| 表名 | 关键字段 | 作用 |
+|------|----------|------|
+| `licenses` | `id`, `seats`(总量), `reassignable`(bool), `company_id` | 许可证主表，`seats` 字段记录声明的席位总数 |
+| `license_seats` | `id`, `license_id`, `assigned_to`(nullable), `asset_id`(nullable), `unreassignable_seat`(bool), `notes`, `created_by`, `deleted_at` | 席位实例表，每条记录对应一个席位 |
+
+> 原始建表迁移：[2013_11_25_031458_create_license_seats_table.php](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/database/migrations/2013_11_25_031458_create_license_seats_table.php)  
+> `asset_id` 列追加：[2014_07_17_085822_add_asset_to_software.php](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/database/migrations/2014_07_17_085822_add_asset_to_software.php)  
+> `unreassignable_seat` 列追加：[2025_01_15_190348_adds_unavailable_to_license_seats_tables.php](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/database/migrations/2025_01_15_190348_adds_unavailable_to_license_seats_tables.php)
+
+### 1.2 模型关系
+
+```
+License (1) ──hasMany──▶ LicenseSeat (N)
+LicenseSeat ──belongsTo──▶ License      (license_id)
+LicenseSeat ──belongsTo──▶ User         (assigned_to)   ← 归属关系：用户
+LicenseSeat ──belongsTo──▶ Asset        (asset_id)      ← 归属关系：资产
+License ──belongsToMany──▶ User         (通过 license_seats.assigned_to → license_seats.license_id)
+User   ──belongsToMany──▶ License       (通过 license_seats.assigned_to → license_seats.license_id)
+```
+
+> 模型定义分别位于 [License.php](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php) 和 [LicenseSeat.php](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/LicenseSeat.php)
+
+---
+
+## 2. 可用余量的计算机制——"无冗余字段，纯查询推导"
+
+Snipe-IT **没有**在 `licenses` 表上维护一个 `remaining_seats` 计数字段。所有余量数据均通过 **实时查询 `license_seats` 表的状态** 来推导。这意味着余量永远是 `license_seats` 记录当前归属状态的投影，不存在"缓存不同步"问题。
+
+### 2.1 核心计算方法
+
+| 方法 | 位置 | 逻辑 | 返回类型 |
+|------|------|------|----------|
+| `remaincount()` | [License.php#L740-L748](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L740-L748) | `总席位数 - 已分配席位数 - 不可再分配席位数` | `int` |
+| `availCount()` | [License.php#L631-L638](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L631-L638) | 查询 `assigned_to IS NULL AND asset_id IS NULL AND unreassignable_seat = false AND deleted_at IS NULL` | `Relation`（可 count） |
+| `getAvailSeatsCountAttribute()` | [License.php#L668-L675](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L668-L675) | 对 `availCount()` 取聚合 count | `int` |
+| `freeSeat()` | [License.php#L806-L817](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L806-L817) | `availCount()` 条件 + `orderBy('id','asc')->first()` | `LicenseSeat\|null` |
+| `freeSeats()` | [License.php#L828-L831](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L828-L831) | `whereNull('assigned_to')->whereNull('deleted_at')->whereNull('asset_id')` | `Relation` |
+| `getFreeSeatCountAttribute()` | [License.php#L393-L396](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L393-L396) | 委托给 `remaincount()`，作为 `$appends` 属性暴露 | `int` |
+| `percentRemaining()` | [License.php#L465-L476](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L465-L476) | `(可用席位数 / 总席位数) * 100` | `float` |
+
+**`remaincount()` 的核心公式：**
+
+```
+可用余量 = license_seats_count(总记录数) - assigned_seats_count(已分配数) - unReassignableCount(不可再分配数)
+```
+
+其中：
+- `license_seats_count` 通过 `licenseSeatsRelation` 聚合查询得到（[License.php#L573-L594](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L573-L594)）
+- `assigned_seats_count` 通过 `assignedCount` 查询 `assigned_to IS NOT NULL OR asset_id IS NOT NULL` 得到（[License.php#L686-L712](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L686-L712)）
+- `unReassignableCount` 查询 `unreassignable_seat = true` 的席位数量（[License.php#L721-L731](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L721-L731)）
+
+---
+
+## 3. 席位分配（Checkout）链路
+
+### 3.1 Web UI 单席分配
+
+**入口路由：** `POST /licenses/{licenseId}/checkout/{seatId?}`  
+**控制器：** [LicenseCheckoutController::store()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckoutController.php#L79-L157)
+
+```
+请求进入
+  │
+  ├─ 1. License::find($licenseId)        查找许可证
+  ├─ 2. authorize('checkout', $license)  权限校验
+  ├─ 3. availCount()->count() < 1 ?      余量守卫 ← 【关键同步点】
+  ├─ 4. isInactive() ?                   有效性守卫（过期/终止）
+  ├─ 5. findLicenseSeatToCheckout()      确定目标席位
+  │     ├─ LicenseSeat::find($seatId)    指定席位
+  │     └─ $license->freeSeat()          或取第一个空闲席位 ← 【关键同步点】
+  ├─ 6. checkoutToUser() / checkoutToAsset()  写入归属
+  │     ├─ $licenseSeat->assigned_to = $user->id   (分配给用户)
+  │     ├─ $licenseSeat->asset_id = $asset->id     (分配给资产)
+  │     ├─ $licenseSeat->save()                     持久化 ← 【余量自动减少】
+  │     └─ event(CheckoutableCheckedOut)            触发事件
+  └─ 7. 返回重定向
+```
+
+**归属关系写入后的余量自动变化原理：** 当 `assigned_to` 或 `asset_id` 从 `NULL` 变为非空值并 `save()` 后，该席位不再满足 `availCount()` 的查询条件（`whereNull('assigned_to')` / `whereNull('asset_id')`），因此下一次查询余量时自动减少。**无需手动维护计数器。**
+
+### 3.2 API 席位更新（分配/回收统一入口）
+
+**入口路由：** `PUT /api/licenses/{licenseId}/seats/{seatId}`  
+**控制器：** [LicenseSeatsController::update()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Api/LicenseSeatsController.php#L101-L248)
+
+```
+请求进入
+  │
+  ├─ 1. 校验 assigned_to / asset_id（互斥，prohibits 规则）
+  ├─ 2. authorize('checkout', License::class)
+  ├─ 3. 查找 licenseSeat，校验 license 归属
+  ├─ 4. FMCS 公司隔离校验（full_multiple_companies_support）
+  ├─ 5. 记录 oldUser / oldAsset（用于日志）
+  ├─ 6. $licenseSeat->fill($validated)
+  ├─ 7. 判断操作类型：
+  │     ├─ isDirty('assigned_to') || isDirty('asset_id')  →  归属变更
+  │     ├─ assigned_to === null && asset_id === null       →  回收(checkin)
+  │     └─ 否则                                             →  分配(checkout)
+  ├─ 8. unreassignable_seat 守卫：不可再分配的席位拒绝变更
+  └─ 9. DB::transaction {                    ← 【事务原子性保障】
+         $licenseSeat->save()
+         if (checkin && !reassignable)
+           $licenseSeat->unreassignable_seat = true; save()
+         logCheckin / logCheckout
+       }
+```
+
+**事务保障要点：** `save()` 与 `logCheckin/logCheckout` 被包裹在同一 `DB::transaction` 中，确保席位状态变更与审计日志的原子性——要么全部成功，要么全部回滚。
+
+### 3.3 批量分配
+
+**入口路由：** `POST /licenses/{licenseId}/bulkcheckout`  
+**控制器：** [LicenseCheckoutController::bulkCheckout()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckoutController.php#L227-L281)
+
+```
+获取 avail_count = getAvailSeatsCountAttribute()
+获取开启了 autoassign_licenses 的用户列表
+foreach user:
+  ├─ 跳过已有此许可证的用户
+  ├─ $license->freeSeat()           取空闲席位
+  ├─ $licenseSeat->assigned_to = user->id
+  ├─ $licenseSeat->save()            ← 持久化，余量自动减少
+  ├─ $avail_count--                  ← 内存计数器递减（提前退出判断用）
+  ├─ logCheckout()
+  └─ if $avail_count == 0 → break
+```
+
+### 3.4 CLI 批量分配
+
+**命令：** `php artisan snipeit:checkout-to-all --license_id=X`  
+**文件：** [CheckoutLicenseToAllUsers.php](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Console/Commands/CheckoutLicenseToAllUsers.php#L80-L103)
+
+逻辑与 Web 批量分配一致：循环用户 → `freeSeat()` → 设 `assigned_to` → `save()` → `logCheckout()`。
+
+### 3.5 预定义套件分配
+
+**服务：** [PredefinedKitCheckoutService](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Services/PredefinedKitCheckoutService.php#L103-L120)
+
+```
+getLicenseSeatsToAdd():
+  foreach kit.licenses:
+    ├─ 检查 freeSeats 数量是否 ≥ pivot.quantity
+    ├─ 取前 N 个 freeSeats 作为待分配席位
+  saveToDb() [DB::transaction]:
+    foreach seats:
+      ├─ assigned_to = user->id
+      ├─ save()
+      └─ event(CheckoutableCheckedOut)
+```
+
+---
+
+## 4. 席位回收（Checkin）链路
+
+### 4.1 Web UI 单席回收
+
+**入口路由：** `POST /licenses/{licenseId}/checkin/{backTo?}`  
+**控制器：** [LicenseCheckinController::store()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckinController.php#L57-L120)
+
+```
+请求进入
+  │
+  ├─ 1. LicenseSeat::find($seatId)
+  ├─ 2. 守卫：assigned_to 和 asset_id 都为 null → 不可回收
+  ├─ 3. authorize('checkout', $license)
+  ├─ 4. 记录 return_to（原归属用户/资产，用于日志）
+  ├─ 5. 清除归属：
+  │     ├─ $licenseSeat->assigned_to = null
+  │     └─ $licenseSeat->asset_id = null
+  ├─ 6. 不可再分配标记：
+  │     if (!license->reassignable)
+  │       $licenseSeat->unreassignable_seat = true   ← 【关键：余量不会恢复】
+  ├─ 7. $licenseSeat->save()                          ← 持久化
+  └─ 8. event(CheckoutableCheckedIn)                  触发事件
+```
+
+**`reassignable` 与 `unreassignable_seat` 的交互：**
+
+| `license.reassignable` | 回收后 `unreassignable_seat` | 余量是否恢复 |
+|:---:|:---:|:---:|
+| `true` | 保持 `false` | ✅ 恢复（席位重新进入可用池） |
+| `false` | 设置为 `true` | ❌ 不恢复（席位被永久"冻结"） |
+
+这意味着：当一个许可证标记为"不可再分配"时，即使席位被回收，该席位的 `unreassignable_seat` 会被置为 `true`，导致 `availCount()` 查询（条件含 `unreassignable_seat = false`）不会将其计入可用余量。
+
+### 4.2 API 回收
+
+与 API 分配共享同一个 `update()` 方法（见 3.2），通过 `is_checkin` 标志位区分。关键差异：回收时额外执行：
+
+```php
+if (!$licenseSeat->license->reassignable) {
+    $licenseSeat->unreassignable_seat = true;
+    $licenseSeat->save();
+}
+$licenseSeat->logCheckin($target, $notes);
+```
+
+### 4.3 批量回收
+
+**入口路由：** `POST /licenses/{licenseId}/bulkcheckin`  
+**控制器：** [LicenseCheckinController::bulkCheckin()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckinController.php#L134-L178)
+
+分两轮处理：
+1. **按用户回收**：`whereNotNull('assigned_to')` → `assigned_to = null` + 不可再分配标记 + `save()` + `logCheckin()`
+2. **按资产回收**：`whereNotNull('asset_id')` → `asset_id = null` + 不可再分配标记 + `save()` + `logCheckin()`
+
+---
+
+## 5. 席位总量变更时的同步调整
+
+当管理员修改 `licenses.seats` 字段时，需要同步增减 `license_seats` 记录数。
+
+**触发点：** [License::boot()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L142-L170) 中的模型事件监听
+
+```
+License::created  → adjustSeatCount($license, 0, $newSeats)     // 新建时从 0 创建
+License::updating → adjustSeatCount($license, $oldCount, $new)  // 更新时按实际记录数调整
+```
+
+**[adjustSeatCount()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/License.php#L218-L287) 逻辑：**
+
+```
+oldSeats == newSeats → 无操作，返回 true
+
+newSeats > oldSeats（增加席位）:
+  ├─ 循环创建 LicenseSeat 记录（license_id, created_by, timestamps）
+  ├─ 分块(1000) + DB::transaction 批量插入
+  └─ 记录 Actionlog（"added N seats"）
+
+newSeats < oldSeats（减少席位）:
+  ├─ 查找可用待删除席位：whereNull('assigned_to')->whereNull('asset_id')->limit($change)
+  ├─ if 待删除数 < 需删除数 → 拒绝操作（Session::flash error） ← 【保护已分配席位】
+  ├─ 删除找到的席位
+  └─ 记录 Actionlog（"deleted N seats"）
+```
+
+**关键安全机制：** 减少席位时，只会删除 `assigned_to IS NULL AND asset_id IS NULL` 的空闲席位。如果已分配席位数使得无法删除足够的席位，操作会被拒绝。这保证了已建立的归属关系不会被强制破坏。
+
+---
+
+## 6. 事件驱动的通知与日志同步
+
+### 6.1 事件体系
+
+```
+CheckoutableCheckedOut  ──▶  LogListener::onCheckoutableCheckedOut()  ──▶  logCheckout()
+                     └──▶  CheckoutableListener::onCheckedOut()       ──▶  邮件/Webhook通知 + CheckoutAcceptance
+
+CheckoutableCheckedIn   ──▶  LogListener::onCheckoutableCheckedIn()   ──▶  logCheckin()
+                     └──▶  CheckoutableListener::onCheckedIn()        ──▶  邮件/Webhook通知 + 删除待处理Acceptance
+```
+
+### 6.2 审计日志的归属映射
+
+在 [Loggable::determineLogItemType()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Models/Traits/Loggable.php#L212-L224) 中，LicenseSeat 的日志特殊处理：
+
+```php
+if (static::class == LicenseSeat::class) {
+    $log->item_type = License::class;   // 日志关联到 License 而非 LicenseSeat
+    $log->item_id = $this->license_id;
+}
+```
+
+这意味着所有席位操作的审计日志在 `action_logs` 表中关联的是 `License` 类，而非 `LicenseSeat` 类，使得在许可证维度查看操作历史更为直观。
+
+### 6.3 事件监听注册
+
+| 监听器 | 注册方式 | 文件 |
+|--------|---------|------|
+| [LogListener](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Listeners/LogListener.php) | `subscribe()` 方法批量注册 | 监听 5 类事件 |
+| [CheckoutableListener](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Listeners/CheckoutableListener.php) | `subscribe()` 方法 | 监听 CheckIn/CheckOut |
+
+---
+
+## 7. 完整同步维护链路总结图
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                      席位分配 (Checkout)                              │
+│                                                                      │
+│  请求 ──▶ 权限校验 ──▶ 余量检查(availCount) ──▶ 取空闲席位(freeSeat) │
+│                                              │                       │
+│                                    ┌─────────▼──────────┐           │
+│                                    │ LicenseSeat.save()  │           │
+│                                    │ assigned_to = X     │           │
+│                                    │ asset_id = Y        │           │
+│                                    └─────────┬──────────┘           │
+│                                              │                       │
+│                         ┌────────────────────┼────────────────┐     │
+│                         ▼                    ▼                ▼     │
+│                  DB 记录已变更      CheckoutableCheckedOut   Log    │
+│                  余量自动减少       → 邮件通知                记录   │
+│                  (下次查询时        → Webhook通知             写入   │
+│                   自然体现)         → Acceptance创建          action │
+│                                                              _logs  │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                      席位回收 (Checkin)                               │
+│                                                                      │
+│  请求 ──▶ 权限校验 ──▶ 已分配守卫 ──▶ 记录原归属 ──▶ 清除归属字段   │
+│                                              │                       │
+│                                    ┌─────────▼──────────┐           │
+│                                    │ LicenseSeat.save()  │           │
+│                                    │ assigned_to = null  │           │
+│                                    │ asset_id = null     │           │
+│                                    └─────────┬──────────┘           │
+│                                              │                       │
+│                              ┌───────────────┼───────────────┐      │
+│                              ▼                               ▼      │
+│                   reassignable=true              reassignable=false │
+│                   余量自动恢复                    unreassignable_    │
+│                   (席位重回可用池)                 seat = true       │
+│                                                  余量不恢复         │
+│                                                  (席位被冻结)       │
+│                                              │                       │
+│                         ┌────────────────────┼────────────────┐     │
+│                         ▼                    ▼                ▼     │
+│                  DB 记录已变更      CheckoutableCheckedIn    Log    │
+│                  余量按规则变化     → 邮件通知                记录   │
+│                                    → Webhook通知             写入   │
+│                                    → 删除待处理Acceptance    action │
+│                                                              _logs  │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                   席位总量调整 (adjustSeatCount)                       │
+│                                                                      │
+│  License.seats 变更 ──▶ boot() 事件监听 ──▶ adjustSeatCount()       │
+│                                              │                       │
+│                              ┌───────────────┼───────────────┐      │
+│                              ▼                               ▼      │
+│                     增加席位                          减少席位        │
+│                     LicenseSeat::insert()        查找空闲席位        │
+│                     (分块+事务)                   (assigned_to=null   │
+│                                                    asset_id=null)   │
+│                                              不足则拒绝操作         │
+│                                              够则 delete()          │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 8. 设计要点与权衡
+
+### 8.1 一致性保障策略
+
+| 策略 | 实现方式 | 涉及代码 |
+|------|----------|----------|
+| **查询时推导** | 可用余量不存储，通过 `availCount()`/`remaincount()` 实时查询 | License 模型多处 |
+| **事务原子性** | API 操作使用 `DB::transaction` 包裹 save + log | LicenseSeatsController::update() |
+| **模型事件** | `License::boot()` 监听 created/updating 自动调整席位数 | License.php#L142-L170 |
+| **归属字段即状态** | `assigned_to`/`asset_id` 的 NULL/非NULL 直接决定席位是否可用 | 全链路 |
+
+### 8.2 潜在风险点
+
+1. **Web UI 非事务性**：[LicenseCheckoutController::store()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckoutController.php#L79-L157) 和 [LicenseCheckinController::store()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckinController.php#L57-L120) 中的 `save()` 和 `event()` 不在事务中，如果 `save()` 成功但事件处理失败，可能出现席位已变更但通知/日志丢失的情况。相比之下，API 端的 `LicenseSeatsController::update()` 使用了 `DB::transaction`。
+
+2. **批量操作的竞态**：[bulkCheckout()](file:///d:/fz/0601-1/solo-dogfeeding/code/42-snipe-it/app/Http/Controllers/Licenses/LicenseCheckoutController.php#L227-L281) 在循环中逐个 `freeSeat()` → `save()`，在并发场景下可能出现 `freeSeat()` 返回同一席位给不同请求的情况。没有使用数据库级锁（如 `LOCK FOR UPDATE`）。
+
+3. **`remaincount()` 与 `availCount()` 的语义差异**：`remaincount()` 使用聚合计算（总数 - 已分配 - 不可再分配），而 `availCount()` 使用条件查询（NULL + false + 未删除），两者在极端数据不一致时可能产生不同结果。
+
+### 8.3 `unreassignable_seat` 的作用
+
+该字段是"不可再分配许可证"业务规则的实现关键：
+
+- **场景**：企业购买了 100 席位许可证，标记为 `reassignable = false`。当员工 A 离职归还席位时，该席位不应再次分配给员工 B（许可证条款限制）。
+- **实现**：回收时将 `unreassignable_seat = true`，使该席位从 `availCount()` 查询中永久排除。
+- **效果**：`remaincount()` = 总数 - 已分配 - 不可再分配，准确反映真正可分配的余量。
+
+---
+
+## 9. 各操作入口一览
+
+| 操作 | 路由/入口 | 控制器/命令 | 事务保护 |
+|------|-----------|-------------|----------|
+| 单席分配(Web) | `POST /licenses/{id}/checkout/{seatId?}` | LicenseCheckoutController::store() | ❌ 无 |
+| 单席回收(Web) | `POST /licenses/{id}/checkin/{backTo?}` | LicenseCheckinController::store() | ❌ 无 |
+| 席位更新(API) | `PUT /api/licenses/{id}/seats/{seatId}` | LicenseSeatsController::update() | ✅ DB::transaction |
+| 批量分配 | `POST /licenses/{id}/bulkcheckout` | LicenseCheckoutController::bulkCheckout() | ❌ 无 |
+| 批量回收 | `POST /licenses/{id}/bulkcheckin` | LicenseCheckinController::bulkCheckin() | ❌ 无 |
+| CLI 批量分配 | `php artisan snipeit:checkout-to-all` | CheckoutLicenseToAllUsers | ❌ 无 |
+| 套件分配 | Kit checkout flow | PredefinedKitCheckoutService::checkout() | ✅ DB::transaction |
+| 席位总量调整 | License 创建/更新 | License::boot() → adjustSeatCount() | ✅ 分块事务 |
+| 批量删除许可证 | `POST /licenses/bulk/delete` | BulkLicensesController::destroy() | ❌ 无（但有守卫） |
