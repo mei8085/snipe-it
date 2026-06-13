@@ -502,7 +502,7 @@ $licenseSeat->save();
 | 资产（自由分配） | 可能设为资产持有人 | 设为目标资产 ID | 席位原先是空闲的 |
 | 资产（指定席位） | 可能被**覆盖**为资产持有人 | **直接覆盖**为目标资产 ID | 原归属被静默替换 |
 
-> ⚠️ **注意**：Web UI 的指定席位分配路径不检查 `unreassignable_seat`，也不检查席位是否已分配。这与 API 端的 `LicenseSeatsController::update()` 不同——API 端有明确的 `unreassignable_seat` 守卫。
+> ⚠️ **注意**：Web 端指定席位分配路径既不检查席位是否已被分配，也不检查 `unreassignable_seat` 标记。API 端 `LicenseSeatsController::update()` 虽有 `unreassignable_seat` 守卫，但该守卫**仅在归属字段发生变更时（`$assignmentTouched = true`）激活**，且同样不会检查席位原先是否已被分配——两条路径在覆盖既有归属关系时行为一致，都允许静默覆盖。差异在于守卫机制的互补不对称，详见 10.3 节。
 
 ### 10.3 API 端席位更新的边界判断
 
@@ -721,10 +721,10 @@ foreach ($license_seats_to_add as $licenseSeat) {
    - API 端更新路径：无**整体余量守卫**，但有**席位级 `unreassignable_seat` 守卫**（仅归属变更时）。
    - 这导致两种接口在特定边界条件下会给出相反的通过/拒绝结果。
 
-3. **两者都允许静默覆盖既有归属**：
-   - 无论是 Web 端指定席位还是 API 端更新，**都不检查席位原先是否已被分配**。
-   - 直接用新值覆盖 `assigned_to` / `asset_id`，原有归属关系被静默替换。
-   - 差异仅在于：Web 端通过 `event(CheckoutableCheckedOut)` 触发日志，API 端在事务内直接调用 `logCheckout()`。
+3. **两者都允许静默覆盖既有归属，但守卫机制互补**：
+   - 无论是 Web 端指定席位还是 API 端更新，**都不检查席位原先是否已被分配**，都允许直接用新值覆盖 `assigned_to` / `asset_id`。
+   - 守卫机制呈现**互补不对称**：Web 端有整体余量守卫但无席位级 `unreassignable_seat` 守卫；API 端无整体余量守卫但有席位级守卫。
+   - 这导致两种接口在特定边界条件下给出相反的通过/拒绝结果：冻结席位在 Web 端可分配、在 API 端被拒绝；整体余量为 0 时 Web 端拒绝、API 端允许。
 
 4. **Web 端整体余量守卫的时序问题**：
    - Web 端 `availCount() < 1` 检查发生在获取席位**之前**（store 第 88 行 vs 第 97 行）。
