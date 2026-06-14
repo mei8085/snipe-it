@@ -305,6 +305,51 @@ private static function scopeCompanyablesDirectly($query, $column = 'company_id'
 - 使用 `Schema::hasColumn()` 动态检查表是否有 `company_id` 列，避免 SQL 错误
 - 支持通过 `$table_name` 参数指定别名表名（用于复杂 join 查询）
 
+### 3.5.1 Schema::hasColumn 静默跳过的边界风险
+
+`scopeCompanyablesDirectly()` 中（[Company.php#L319-L326](file:///d:/fz/0601-1/solo-dogfeeding/code/95-snipe-it/app/Models/Company.php#L319-L326)）：
+
+```php
+if ((($query) && ($query->getModel())
+     && (Schema::hasColumn($query->getModel()->getTable(), $column)))) {
+    $table = ($table_name) ? $table_name.'.' : $query->getModel()->getTable().'.';
+    return $query->where($table.$column, '=', $company_id);
+}
+```
+
+**行为**：如果模型绑定的数据表**没有** `company_id` 列，整个 `if` 块不执行，**静默地不添加任何 `WHERE` 条件**。方法最后没有 `else` 分支，也没有报错。
+
+**实际后果**：
+- 对于本应有 company_id 列但因迁移遗漏导致缺失的表，FMCS 约束完全失效
+- 对于被错误地使用了 CompanyableTrait 但表本身没有 company_id 列的模型（如 [ConsumableAssignment](file:///d:/fz/0601-1/solo-dogfeeding/code/95-snipe-it/app/Models/ConsumableAssignment.php)），跨公司数据对所有用户可见
+- 这是一个**静默失效**的设计——没有日志、没有异常，范围约束悄然关闭
+
+### 3.5.2 Auth::hasUser() 而非 auth()->check() 的决策依据
+
+代码中带有明确的 PR 链接注释（[Company.php#L303](file:///d:/fz/0601-1/solo-dogfeeding/code/95-snipe-it/app/Models/Company.php#L303)）：
+
+```php
+* @see https://github.com/laravel/framework/pull/24518 for info on Auth::hasUser()
+```
+
+该 PR 解释了两者的本质区别：
+
+| 方法 | 行为 | 副作用 |
+|---|---|---|
+| `Auth::hasUser()` | 只检查 `$this->user` 属性是否已设置 | ❌ 无副作用，不会触发 DB 访问或外部认证 |
+| `auth()->check()` | 内部调用 `auth()->user()` | ✅ 可能触发数据库查询或外部 API 请求 |
+
+**决策依据**：
+1. **模型层不应触发认证副作用**：Global Scope 可能在任何模型查询时执行（包括首页、列表、关联预加载），如果用 `auth()->check()`，在未登录且使用外部认证（如 LDAP、OAuth）的场景下，可能触发不必要的网络请求甚至抛出异常
+2. **CLI/命令行场景**：`Auth::hasUser()` 在无 session 环境下返回 false，直接跳过范围过滤（见 `scopeCompanyables()` L292 的 `!Auth::hasUser()` 条件），这是代码显式设计的"命令行不限制范围"策略
+3. **边界定义**：`Auth::hasUser()` 只判断"是否已经有一个用户实例被加载到内存"，不判断该用户是否通过了正式认证。如果 session 还未初始化（如中间件执行前、tinker 中），`Auth::hasUser()` 为 false
+
+**调用位置对比**：
+- `scopeCompanyables()` ([L270-L272](file:///d:/fz/0601-1/solo-dogfeeding/code/95-snipe-it/app/Models/Company.php#L270-L272)) 用 `Auth::hasUser()` 跳过范围
+- `scopeCompanyablesDirectly()` ([L310-L311](file:///d:/fz/0601-1/solo-dogfeeding/code/95-snipe-it/app/Models/Company.php#L310-L311)) 用 `Auth::hasUser()` 获取公司ID
+- `scopeCompanyableChildren()` ([L344](file:///d:/fz/0601-1/solo-dogfeeding/code/95-snipe-it/app/Models/Company.php#L344)) 同样用 `Auth::hasUser()`
+- 而写入层 `getIdForCurrentUser()` ([L132](file:///d:/fz/0601-1/solo-dogfeeding/code/95-snipe-it/app/Models/Company.php#L132)) 和 `getIdForUser()` ([L236](file:///d:/fz/0601-1/solo-dogfeeding/code/95-snipe-it/app/Models/Company.php#L236)) 直接用 `auth()->user()`，因为这些方法只在 HTTP 请求流程中被控制器调用，session 已初始化
+
 ### 3.6 CompanyableChildTrait + CompanyableChildScope — 子关联范围链路
 
 这条链路与直接范围链路平行，用于模型自身**没有** `company_id` 列，但可以通过父级关联来推断公司范围的场景。
