@@ -711,3 +711,241 @@ php artisan snipeit:inventory-alerts
 | **withoutGlobalScopes 绕过** | ✅ **功能性旁路** | checkout 目标解析、日志展示、导入、报表关联等 | 绕过之后必有显式 FMCS 二次检查 |
 | **Console 命令（无 Auth 用户）** | ✅ **天然跨公司** | 所有 Artisan 命令中的查询 | `Auth::hasUser() === false` 导致切片 no-op |
 | **独立按 Location.id 切片** | ❌ **不存在** | — | — |
+
+---
+
+## 十七、Asset Checkout 主流程中的 withoutGlobalScopes 详解
+
+### 17.1 API checkout：三路 withoutGlobalScopes + 显式 FMCS 校验
+
+[Api\AssetsController::checkout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L1016-L1098) 中，对三种 checkout 目标类型分别绕过 Global Scope 解析，然后用 `checkoutCompanyMismatchResponse()` 显式校验：
+
+```php
+// checkout_to_type == 'location'
+$target = Location::withoutGlobalScopes()->find(request('assigned_location'));
+
+// checkout_to_type == 'asset'
+$target = Asset::withoutGlobalScopes()->where('id', '!=', $asset_id)->find(request('assigned_asset'));
+
+// checkout_to_type == 'user'
+$target = User::withoutGlobalScopes()->find(request('assigned_user'));
+```
+
+然后在 L1070 显式校验：
+```php
+if ($mismatch = $this->checkoutCompanyMismatchResponse($asset, $target)) {
+    return $mismatch;  // 返回 "Checkout target company and asset company do not match"
+}
+```
+
+[checkoutCompanyMismatchResponse()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L914-L921) 内部调用 `canCheckoutTo()`：
+
+```php
+private function checkoutCompanyMismatchResponse(Asset $asset, User|Asset|Location $target): ?JsonResponse
+{
+    if (! $asset->canCheckoutTo($target)) {
+        return response()->json(Helper::formatStandardApiResponse('error', null, trans('general.error_user_company')));
+    }
+    return null;
+}
+```
+
+### 17.2 API update（资产更新+checkout）：同一个 resolveCheckoutTargetForAssetMutation
+
+[Api\AssetsController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L897-L912) 使用提取的私有方法：
+
+```php
+private function resolveCheckoutTargetForAssetMutation(Request $request, ?int $assetId = null): User|Asset|Location|null
+{
+    if ($request->filled('assigned_user')) {
+        return User::withoutGlobalScopes()->find($request->input('assigned_user'));
+    }
+    if ($request->filled('assigned_asset')) {
+        return Asset::withoutGlobalScopes()->where('id', '!=', $assetId)->find($request->input('assigned_asset'));
+    }
+    if ($request->filled('assigned_location')) {
+        return Location::withoutGlobalScopes()->find($request->input('assigned_location'));
+    }
+    return null;
+}
+```
+
+创建(store)和更新(update)两个 action 都调用此方法，且都在后续通过 `checkoutCompanyMismatchResponse()` 做显式校验。
+
+### 17.3 Web UI checkout：未使用 withoutGlobalScopes — 静默失败
+
+**关键差异**：[Assets\AssetsController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L231-L254)（Web UI 控制器）在 store 流程中解析 checkout 目标时**没有绕过 Global Scope**：
+
+```php
+if ($userId = request('assigned_user')) {
+    $target = User::find($userId);              // ← 受 FMCS Global Scope 约束
+    if (! $target) {
+        return redirect()->back()->withInput()->with('error', '...target_not_found.user');
+    }
+    $location = $target->location_id;
+
+} elseif ($assetId = request('assigned_asset')) {
+    $target = Asset::find($assetId);            // ← 受 FMCS Global Scope 约束
+    ...
+} elseif ($locationId = request('assigned_location')) {
+    $target = Location::find($locationId);      // ← 受 FMCS Global Scope 约束
+    ...
+}
+```
+
+**影响**：当 FMCS 开启时，如果用户尝试将资产 checkout 给另一个公司的用户/资产/地点：
+- API：返回明确错误 `"Checkout target company and asset company do not match"`
+- Web UI：返回 `"Target not found"`（因为 Global Scope 将跨公司目标过滤掉了，`find()` 返回 null）
+
+这是一个**已知的行为差异**：Web UI 无法区分"目标不存在"和"目标存在但跨公司"两种情况。API 的 `withoutGlobalScopes` 正是为了解决此问题。
+
+### 17.4 Web UI update：不做 checkout 操作
+
+[Assets\AssetsController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L395-L524) 在更新时**不处理 checkout**，只修改资产属性（含 `Company::getIdForCurrentUser()` 约束 company_id 赋值），因此不涉及目标解析和 Global Scope 绕过。
+
+---
+
+## 十八、withoutGlobalScope vs withoutGlobalScopes 写法差异
+
+代码中出现了两种写法，对应 Laravel Eloquent 的两个不同 API：
+
+### 18.1 `withoutGlobalScopes()`（无参数 / 传类名数组）
+
+| 调用方式 | 语义 | 代码中的用法 |
+|---|---|---|
+| `Model::withoutGlobalScopes()` | 移除**所有** Global Scope（含 SoftDeletes 等） | 目标解析时使用（如 `User::withoutGlobalScopes()->find($id)`），确保跨公司查找不受任何 Scope 干扰 |
+| `Model::withoutGlobalScopes([ScopeA::class, ScopeB::class])` | 只移除指定的多个 Scope | 未在代码中使用 |
+
+### 18.2 `withoutGlobalScope(CompanyableScope::class)`（单数，传类名或实例）
+
+| 调用方式 | 语义 | 代码中的用法 |
+|---|---|---|
+| `->withoutGlobalScope(CompanyableScope::class)` | 只移除**单个**指定 Scope | 关系定义中使用（如 `HasUploads`、`Loggable`），精确移除公司切片但保留 SoftDeletes 等其他 Scope |
+| `->withoutGlobalScope(new CompanyableScope)` | 同上，传实例 | [Component::unconstrainedAssets()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Models/Component.php#L322) 使用此写法 |
+
+### 18.3 实际差异与风险
+
+| 写法 | 移除范围 | 是否移除 SoftDeletes | 风险 |
+|---|---|---|---|
+| `withoutGlobalScopes()` | **所有** Scope | ✅ 是 | 可能查到已软删除的记录，需自行加 `whereNull('deleted_at')` |
+| `withoutGlobalScope(CompanyableScope::class)` | 仅 CompanyableScope | ❌ 否 | 更精确安全，但需确保引入正确的类名 |
+
+代码中 `LicensesController` 使用 `withoutGlobalScopes()` 后显式加了 `whereNull('deleted_at')`：
+```php
+$target = User::withoutGlobalScopes()->whereNull('deleted_at')->find($validated['assigned_to'] ?? null);
+```
+
+而 `HasUploads` / `Loggable` 使用 `withoutGlobalScope(CompanyableScope::class)` 只移除公司切片，保留 SoftDeletes 保护。
+
+### 18.4 `removeGlobalScope()` — 代码中未使用
+
+`removeGlobalScope()` 是在运行时从模型上**永久移除**一个 Global Scope（影响后续所有查询），而非在单次查询上临时绕过。全仓搜索确认代码中**没有任何 `removeGlobalScope` 调用**。所有绕过都是临时性的（单次查询级别）。
+
+---
+
+## 十九、Reports 切片说法修正
+
+前文（第十四节）称"ReportsController 中所有报表查询都没有显式调用 `withoutGlobalScopes()`"，这**不完全准确**。修正如下：
+
+### 19.1 Reports 首页（index）：隐式依赖 Global Scope
+
+[ReportsController::index()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/ReportsController.php#L57-L80) 中的四个计数全部依赖 Global Scope 隐式切片：
+
+```php
+$audit_alert_count = Asset::DueOrOverdueForAudit($settings)->count();         // ← Global Scope 隐式切片
+$checkin_alert_count = Asset::DueOrOverdueForCheckin($settings)->count();     // ← 同上
+$pending_acceptance_count = CheckoutAcceptance::pending()
+    ->whereHasMorph('checkoutable', [...])->count();                          // ← 通过 whereHasMorph 间接受父模型 Scope 约束
+$licenses_low_count = License::withCount(['freeSeats as free_seats_count'])
+    ->get()->filter(fn ($l) => $l->free_seats_count <= 0)->count();           // ← Global Scope 隐式切片
+```
+
+**但这里有一个微妙问题**：`CheckoutAcceptance` 本身没有 `company_id` 列，也没有 `CompanyableTrait`。它通过 `whereHasMorph('checkoutable', ...)` 间接受到 checkoutable 类型（Asset/LicenseSeat 等）的 Global Scope 约束。这意味着 FMCS 开启时，非超级用户只能看到**自己公司的 checkoutable 对应的 pending acceptance**。这是正确的。
+
+### 19.2 验收报告：两处显式 withoutGlobalScopes
+
+1. [currentUserCanAccessAcceptance()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/ReportsController.php#L1366-L1391) 中使用 `withoutGlobalScopes()` 做跨公司权限检查：
+
+```php
+$checkoutable = $checkoutableType::withoutGlobalScopes()->find($acceptance->checkoutable_id);
+if ($checkoutable instanceof LicenseSeat) {
+    $itemCompanyId = License::withoutGlobalScopes()->where('id', $checkoutable->license_id)->value('company_id');
+} else {
+    $itemCompanyId = $checkoutable?->company_id;
+}
+return $itemCompanyId === null || (int) $itemCompanyId === (int) $user->company_id;
+```
+
+此处绕过 Global Scope 是必要的——因为 CheckoutAcceptance 没有 Global Scope，如果用 `find()` 查 checkoutable 对象则会受 FMCS 约束，导致"找不到对象"而无法判断公司是否匹配。先绕过查到对象，再显式比较 `company_id`。
+
+2. 验收报告列表 [getAssetAcceptanceReport()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/ReportsController.php#L1462-L1480) 中没有 `withoutGlobalScopes`——`CheckoutAcceptance::pending()` 查询不受 Global Scope（因为模型没有 CompanyableTrait），而 `with('checkoutable', ...)` 的 eager loading 会触发 checkoutable 类型的 Global Scope。因此非超级用户在报告中**只能看到自己公司的待验收项**。
+
+### 19.3 活动报告：Actionlog 的 NULL company_id 泄露
+
+[postActivityReport()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/ReportsController.php#L285-L384) 中：
+
+```php
+$actionlogs = Actionlog::with('item', 'user', 'target', 'location', 'adminuser')
+    ->orderBy('created_at', 'DESC')
+    ->chunk(500, function ($actionlogs) use ($handle) { ... });
+```
+
+Actionlog 的 Global Scope 在 `scopeCompanyablesDirectly()` 中有特殊处理：`action_logs` 表的 NULL `company_id` 记录不隐藏。因此，全局对象（AssetModel、Category、Company 等）的操作日志在 FMCS 开启时**仍对所有有 `reports.view` 权限的用户可见**。这不是绕过，而是设计上故意的（全局对象不属于任何公司）。
+
+### 19.4 自定义资产报告：完全依赖 Global Scope
+
+[postCustom()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/ReportsController.php#L501-L1172) 中的 Asset 查询：
+
+```php
+$assets = Asset::select('assets.*')->with('location', 'status', 'company', 'defaultLoc', 'assignedTo', ...);
+```
+
+**没有 `withoutGlobalScopes()`**，因此 FMCS 开启时自动按公司切片。但 `$request->filled('by_company_id')` 允许用户在前端选择公司过滤——这里的 `whereIn('assets.company_id', ...)` 与 Global Scope 是**叠加**关系（交集），不会放大可见范围。
+
+---
+
+## 二十、Dashboard 总数口径：隐式切片与不一致
+
+### 20.1 DashboardController 的计数代码
+
+[DashboardController::index()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/DashboardController.php#L34-L61)：
+
+```php
+$counts['asset'] = Asset::count();                                    // ← Global Scope 隐式切片
+$counts['accessory'] = Accessory::count();                            // ← 同上
+$counts['license'] = License::assetcount();                           // ← 同上
+$counts['consumable'] = Consumable::count();                          // ← 同上
+$counts['component'] = Component::count();                            // ← 同上
+$counts['user'] = Company::scopeCompanyables(auth()->user())->count(); // ← 显式切片
+$counts['grand_total'] = $counts['asset'] + $counts['accessory'] + $counts['license'] + $counts['consumable'];
+```
+
+### 20.2 口径分析
+
+| 计数项 | 切片方式 | FMCS 关闭时 | FMCS 开启时（非超管 admin） |
+|---|---|---|---|
+| `Asset::count()` | 隐式 Global Scope | 全部资产 | 仅当前用户公司 + 浮动资产 |
+| `Accessory::count()` | 隐式 Global Scope | 全部配件 | 仅当前用户公司 |
+| `License::assetcount()` | 隐式 Global Scope | 全部许可 | 仅当前用户公司 |
+| `Consumable::count()` | 隐式 Global Scope | 全部耗材 | 仅当前用户公司 |
+| `Component::count()` | 隐式 Global Scope | 全部组件 | 仅当前用户公司 |
+| `Company::scopeCompanyables(auth()->user())->count()` | 显式调用 | 全部用户 | 仅当前用户公司 |
+| `grand_total` | 资产+配件+许可+耗材 | 全部 | 仅当前用户公司 |
+
+### 20.3 不一致问题
+
+1. **User 计数用显式调用，其余用隐式 Global Scope**：这不会导致数量错误（两者最终调用同一个 `scopeCompanyablesDirectly()`），但写法不一致。`User` 用显式调用的原因是 `scopeCompanyablesDirectly()` 中 `users` 表走特殊分支（通过 `company_user` 中间表），而 `Asset::count()` 等"碰巧"也走对了路径。
+
+2. **`grand_total` 不含 Component**：Component 数量未被加到 `grand_total` 中，这是原始代码的设计选择（Component 不像 Asset/Accessory/License/Consumable 那样独立核算价值），与 FMCS 无关。
+
+3. **`License::assetcount()`**：这个方法名暗示的是"许可证座位数"而非"许可证种类数"。Global Scope 约束的是 License 模型本身的 `company_id`，不是 LicenseSeat 的分配情况。
+
+4. **超级用户看到的数字**：超管通过 `Gate::before` 在 Policy 层放行，而 Global Scope 中 `scopeCompanyables()` 也会检测 `isSuperUser()` 直接返回原查询，因此超管看到的是**全公司汇总**数字。`Company::scopeCompanyables(auth()->user())->count()` 对超管同样返回全部用户数。
+
+### 20.4 Reports 首页 vs Dashboard 的差异
+
+Reports 首页和 Dashboard 都是 admin-only 页面，但：
+- **Dashboard** 用 `hasAccess('admin')` 做门控，非 admin 被重定向
+- **Reports** 用 `$this->authorize('reports.view')` 做门控，且不受 `admin` 权限限制
+
+这意味着：一个没有 `admin` 权限但有 `reports.view` 权限的用户，可以在 Reports 页面看到按公司切片后的统计数据，但看不到 Dashboard。两者对同一个人看到的数字应该一致（都受 Global Scope 约束），但入口权限不同。
