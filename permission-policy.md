@@ -237,9 +237,46 @@ public function hasAccess($section)
 
 ## 四、中间件链路
 
-### 4.1 中间件注册
+### 4.1 中间件组与路由中间件注册
 
-位置：[app/Http/Kernel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Http/Kernel.php#L102-L111)
+位置：[app/Http/Kernel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Http/Kernel.php)
+
+**Web 中间件组（[L69-L80](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Http/Kernel.php#L69-L80)）：**
+
+```php
+'web' => [
+    EncryptCookies::class,
+    AddQueuedCookiesToResponse::class,
+    VerifyCsrfToken::class,
+    CheckLocale::class,
+    CheckUserIsActivated::class,
+    CheckForTwoFactor::class,
+    CreateFreshApiToken::class,  // Passport Cookie Token 注入
+    CheckColorSettings::class,
+    AuthenticateSession::class,
+    SubstituteBindings::class,
+],
+```
+
+> **CreateFreshApiToken 机制详解**：这是 Laravel Passport 提供的中间件，用于 **Web 会话内的 Cookie 鉴权**。当用户通过 Web 登录后，该中间件在每个响应中自动附加一个加密的 `snipeit_passport_token` Cookie（Cookie 名由 [config/passport.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/config/passport.php#L17) 的 `cookie_name` 定义）。当前端 JavaScript 发起 API 请求时，Passport 的 `TokenGuard` 按以下优先级解析令牌：
+> 1. 优先从 `Authorization: Bearer {token}` 请求头读取 PAT
+> 2. 若请求头无令牌，则从加密 Cookie `snipeit_passport_token` 中解密读取 JWT
+>
+> 这样 Web 前端调用 API 时无需显式管理 PAT，直接复用登录会话即可，实现 Web→API 的无缝鉴权。
+
+**API 中间件组（[L82-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Http/Kernel.php#L82-L88)）：**
+
+```php
+'api' => [
+    'auth:api',                 // 1. Passport TokenGuard 验证 Bearer Token 或 Cookie Token
+    CheckLocale::class,         // 2. 语言/区域设置
+    LogAuthedUserHeader::class, // 3. 在响应头中写入用户信息
+    SetPaginationDefaults::class, // 4. 解析 limit/page/offset，设置容器实例
+    SubstituteBindings::class,  // 5. 路由模型绑定
+],
+```
+
+**路由中间件别名（[L102-L111](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Http/Kernel.php#L102-L111)）：**
 
 ```php
 protected $routeMiddleware = [
@@ -605,10 +642,12 @@ class User extends Authenticatable
     'auth:api',                    // 1. Passport TokenGuard 验证 Bearer Token
     CheckLocale::class,            // 2. 语言/区域检查
     LogAuthedUserHeader::class,    // 3. 记录认证用户头信息
-    SetPaginationDefaults::class,  // 4. 分页默认值（继承自 ThrottleRequests）
+    SetPaginationDefaults::class,  // 4. 设置 API 分页参数（api_limit_value / api_offset_value / api_current_page）
     SubstituteBindings::class,     // 5. 路由模型绑定
 ],
 ```
+
+> **说明**：[SetPaginationDefaults](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Http/Middleware/SetPaginationDefaults.php) 是独立类，**不继承自 ThrottleRequests**。它从请求的 `limit` / `page` / `offset` 参数解析，将 `api_limit_value`、`api_offset_value`、`api_current_page` 绑定到服务容器，供后续控制器读取。限流功能由 `SetAPIResponseHeaders`（别名 `api-throttle`，继承自 ThrottleRequests）在路由层承担。
 
 [routes/api.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/routes/api.php#L18) 中所有 v1 路由自动应用此中间件组：
 
@@ -884,11 +923,14 @@ public function create(Request $request): View
 | 场景 | FormRequest | 控制器 | 说明 |
 |------|-------------|--------|------|
 | Web `store` | ✅ `Gate::allows('create', Asset::class)` | ✅ `$this->authorize(Asset::class)` | 双重检查，FormRequest 先拦截 |
-| Web `create` | ❌ 无 FormRequest | ✅ `$this->authorize('create', Asset::class)` | 仅控制器检查 |
-| API `store` | ✅ `Gate::allows('create', Asset::class)` | ❌ API 控制器通常不做二次检查 | 仅 FormRequest 检查 |
-| Web `checkout` | ❌ `AssetCheckoutRequest` 返回 true | ✅ `$this->authorize('checkout', $asset)` | 权限检查在控制器中 |
+| Web `create` | ❌ 无 FormRequest（普通 Request） | ✅ `$this->authorize('create', Asset::class)` | 仅控制器检查 |
+| **API `store`** | ✅ `Gate::allows('create', Asset::class)` | ❌ 无（StoreAssetRequest 已过滤，直接填充） | AssetsController@store 无二次检查，但其他 API 控制器有 |
+| **API `index` / `show`** | ❌ 无 FormRequest（普通 Request） | ✅ `$this->authorize('view', Asset::class)` | AssetsController@show / showBySerial / licenses 等都有二次检查 |
+| **Statuslabels API** | ❌ 无 FormRequest | ✅ `$this->authorize('view'/'create'/'update'/'delete', ...)` | 所有方法都在控制器内检查 |
+| **Reports API** | ❌ FilterRequest（authorize 返回 true） | ✅ `$this->authorize('reports.view')` + Gate 条件分支 | 复杂权限判断在控制器内 |
+| Web `checkout` | ❌ `AssetCheckoutRequest` 返回 true | ✅ `$this->authorize('checkout', $asset)` | 权限检查在控制器中（需具体实例做公司隔离） |
 
-> **注意**：Web 控制器的 `create` 方法使用普通 `Request`，不经过 FormRequest 授权；而 `store` 方法使用 `StoreAssetRequest`，先经过 FormRequest 授权再进入控制器。checkout/checkin 的 FormRequest 均返回 `true`，将权限检查完全交给控制器——因为此时需要传入具体资产实例进行策略判断（公司隔离检查）。
+> **注意**：Web 控制器的 `create` 方法使用普通 `Request`，不经过 FormRequest 授权；而 `store` 方法使用 `StoreAssetRequest`，先经过 FormRequest 授权再进入控制器。checkout/checkin 的 FormRequest 均返回 `true`，将权限检查完全交给控制器——因为此时需要传入具体资产实例进行策略判断（公司隔离检查）。API 侧并非完全没有二次检查：`AssetsController@show` 调用了 `$this->authorize('view', $asset)`，`StatuslabelsController` 全部方法都有控制器内 authorize，`ReportsController` 包含复杂的 Gate 条件分支。因此「API 控制器通常不做二次检查」的结论不成立——是否二次检查取决于具体控制器，无统一规律。
 
 ### 10.4 prepareForValidation 中的公司 ID 写入隔离
 
