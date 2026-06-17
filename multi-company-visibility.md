@@ -714,13 +714,13 @@ php artisan snipeit:inventory-alerts
 
 ---
 
-## 十七、Asset Checkout 主流程中的目标解析与 Global Scope 绕过
+## 十七、Checkout 主流程中的目标解析与 Global Scope 绕过
 
-Snipe-IT 有 4 条不同的 checkout 主路径，在目标解析和 FMCS 处理上存在显著差异。所有路径都共享 `canCheckoutTo()` 方法做公司匹配检查，但**是否绕过 Global Scope 查找目标**决定了跨公司 checkout 时的错误信息质量。
+Snipe-IT 有 7 条不同的 checkout 主路径（Asset×3、License、Accessory×2、Component、Consumable），在目标解析和 FMCS 处理上存在显著差异。**是否绕过 Global Scope 查找目标**决定了跨公司 checkout 时的错误信息质量。
 
-### 17.1 共用的目标解析核心：determineCheckoutTarget()
+### 17.1 CheckInOutTrait::determineCheckoutTarget() —— 受 Global Scope 约束的共用方法
 
-[CheckInOutTrait::determineCheckoutTarget()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Traits/CheckInOutTrait.php#L15-L28) 是 Web UI 单资产/批量 checkout 路径共用的目标查找方法，**未使用 withoutGlobalScopes**：
+[CheckInOutTrait::determineCheckoutTarget()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Traits/CheckInOutTrait.php#L15-L28) 是一个**未使用 withoutGlobalScopes** 的目标查找方法：
 
 ```php
 protected function determineCheckoutTarget(): ?SnipeModel
@@ -736,25 +736,76 @@ protected function determineCheckoutTarget(): ?SnipeModel
 }
 ```
 
-被以下 5 个控制器复用：
-- [AssetCheckoutController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetCheckoutController.php)（Web 单资产 checkout）
-- [BulkAssetsController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/BulkAssetsController.php)（Web 批量资产 checkout）
-- [AccessoryCheckoutController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Accessories/AccessoryCheckoutController.php)
-- [ComponentCheckoutController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Components/ComponentCheckoutController.php)
-- [ConsumableCheckoutController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Consumables/ConsumableCheckoutController.php)
+**实际使用此 trait 的 5 个控制器**（全仓搜索 `use CheckInOutTrait` 确认）：
+
+| 控制器 | 是否调用 `determineCheckoutTarget()` | 备注 |
+|---|---|---|
+| [AssetCheckoutController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetCheckoutController.php#L19) | ✅ 是 | Web 单资产 checkout |
+| [BulkAssetsController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/BulkAssetsController.php#L35) | ✅ 是 | Web 批量资产 checkout |
+| [AccessoryCheckoutController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Accessories/AccessoryCheckoutController.php#L21) | ✅ 是 | Web 配件 checkout |
+| [Api\AccessoriesController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AccessoriesController.php#L28) | ✅ 是（L308） | API 配件 checkout — **唯一使用 trait 但仍受 Scope 约束的 API 控制器** |
+| [CheckoutKitController](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Kits/CheckoutKitController.php#L26) | ❌ 否 | 使用 `User::find($user_id)` 直接查找（L59），委托 `PredefinedKitCheckoutService` 处理 |
+
+**前文错误**：之前将 ComponentCheckoutController 和 ConsumableCheckoutController 列为 trait 使用者，实际上它们**不使用 CheckInOutTrait**，也不调用 `determineCheckoutTarget()`。
 
 **关键影响**：由于 `findOrFail()` 受 Global Scope 约束，跨公司目标在 FMCS 开启时会被过滤为 null，导致 `findOrFail()` 抛出 `ModelNotFoundException`，用户看到 "Target not found" 而非 "Company mismatch"。
 
-### 17.2 API checkout（checkout 方法）：三路 withoutGlobalScopes + 显式 FMCS 校验
+### 17.2 不使用 CheckInOutTrait 的 Web UI checkout：直接 find + canCheckoutTo
 
-[Api\AssetsController::checkout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L1016-L1098) 中，对三种 checkout 目标类型分别绕过 Global Scope 解析，然后用 `checkoutCompanyMismatchResponse()` 显式校验：
+**Component Web checkout**：[ComponentCheckoutController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Components/ComponentCheckoutController.php#L75-L143) 不使用 trait，直接查找目标：
 
 ```php
-// checkout_to_type == 'location'
+$asset = Asset::find($request->input('asset_id'));              // L104 ← 受 Global Scope 约束
+if (! $component->canCheckoutTo($asset)) {                       // L106 ← 显式检查
+    return redirect()->route('components.checkout.show', $componentId)
+        ->with('error', trans('general.error_checkout_company_mismatch', [...]));
+}
+```
+
+Component checkout **只能借给 Asset**（不能借给 User/Location），因此不需要 `determineCheckoutTarget()` 的三路分发。
+
+**Consumable Web checkout**：[ConsumableCheckoutController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Consumables/ConsumableCheckoutController.php#L71-L172) 同样不使用 trait：
+
+```php
+if (is_null($user = User::find($assigned_to))) {                 // L94 ← 受 Global Scope 约束
+    return redirect()->route('consumables.checkout.show', $consumable)
+        ->with('error', trans('admin/consumables/message.checkout.user_does_not_exist'));
+}
+if (! $consumable->canCheckoutTo($user)) {                       // L99 ← 显式检查
+    return redirect()->back()->with('error', trans('general.error_checkout_company_mismatch', [...]));
+}
+```
+
+Consumable checkout **只能借给 User**，同样不需要三路分发。
+
+**两者共同的跨公司行为**：FMCS 开启时，`find()` 对跨公司目标返回 null → "User does not exist" / "Asset does not exist"，无法区分"不存在"与"跨公司"。
+
+### 17.3 Kit checkout：最薄弱的 FMCS 保护
+
+[CheckoutKitController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Kits/CheckoutKitController.php#L54-L75) 虽然 use 了 CheckInOutTrait，但**既不调用 `determineCheckoutTarget()`，也不调用 `canCheckoutTo()`**：
+
+```php
+$user_id = e($request->input('user_id'));
+if (is_null($user = User::find($user_id))) {                    // L59 ← 受 Global Scope 约束
+    return redirect()->back()->with('error', trans('admin/users/message.user_not_found'));
+}
+$kit = new PredefinedKit;
+$kit->id = $kit_id;
+$checkout_result = $this->kitService->checkout($request, $kit, $user);  // ← 委托给 service
+```
+
+Kit checkout 的 FMCS 保护完全依赖 `PredefinedKitCheckoutService::checkout()` 内部的 Policy 检查（循环 checkout 每个 kit item 时 `authorize('checkout', $asset)` 等），以及 Asset 模型 `checkOut()` 方法内部的可能校验。**目标用户本身的 `find()` 受 Global Scope 约束**，跨公司用户会返回 "User not found" 而非 "Company mismatch"。
+
+### 17.4 API Asset checkout：三路 withoutGlobalScopes + 显式 FMCS 校验
+
+[Api\AssetsController::checkout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php) 中，对三种 checkout 目标类型分别绕过 Global Scope 解析，然后用 `checkoutCompanyMismatchResponse()` 显式校验：
+
+```php
+// L1036: checkout_to_type == 'location'
 $target = Location::withoutGlobalScopes()->find(request('assigned_location'));
-// checkout_to_type == 'asset'
+// L1042: checkout_to_type == 'asset'
 $target = Asset::withoutGlobalScopes()->where('id', '!=', $asset_id)->find(request('assigned_asset'));
-// checkout_to_type == 'user'
+// L1050: checkout_to_type == 'user'
 $target = User::withoutGlobalScopes()->find(request('assigned_user'));
 ```
 
@@ -765,54 +816,50 @@ if ($mismatch = $this->checkoutCompanyMismatchResponse($asset, $target)) {
 }
 ```
 
-[checkoutCompanyMismatchResponse()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L914-L921) 内部调用 `canCheckoutTo()`：
+[checkoutCompanyMismatchResponse()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L914-L921) 内部调用 `canCheckoutTo()`。
+
+### 17.5 API Asset store/update：同一个 resolveCheckoutTargetForAssetMutation
+
+[Api\AssetsController::resolveCheckoutTargetForAssetMutation()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L897-L911) 同样带 `withoutGlobalScopes()`：
 
 ```php
-private function checkoutCompanyMismatchResponse(Asset $asset, User|Asset|Location $target): ?JsonResponse
-{
-    if (! $asset->canCheckoutTo($target)) {
-        return response()->json(Helper::formatStandardApiResponse('error', null, trans('general.error_user_company')));
-    }
-    return null;
-}
-```
-
-### 17.3 API store/update（资产创建+更新）：同一个 resolveCheckoutTargetForAssetMutation
-
-[Api\AssetsController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L897-L912) 使用提取的私有方法，同样带 `withoutGlobalScopes()`：
-
-```php
-private function resolveCheckoutTargetForAssetMutation(Request $request, ?int $assetId = null): User|Asset|Location|null
-{
-    if ($request->filled('assigned_user')) {
-        return User::withoutGlobalScopes()->find($request->input('assigned_user'));
-    }
-    if ($request->filled('assigned_asset')) {
-        return Asset::withoutGlobalScopes()->where('id', '!=', $assetId)->find($request->input('assigned_asset'));
-    }
-    if ($request->filled('assigned_location')) {
-        return Location::withoutGlobalScopes()->find($request->input('assigned_location'));
-    }
-    return null;
-}
+// L900: User::withoutGlobalScopes()->find(...)
+// L904: Asset::withoutGlobalScopes()->where('id', '!=', $assetId)->find(...)
+// L908: Location::withoutGlobalScopes()->find(...)
 ```
 
 创建(store)和更新(update)两个 action 都调用此方法，且都在后续通过 `checkoutCompanyMismatchResponse()` 做显式校验。
 
-### 17.4 Web UI 单资产 checkout（AssetCheckoutController）：先 findOrFail 后 canCheckoutTo
+### 17.6 API Accessories checkout —— 唯一使用 trait 但受 Scope 约束的 API 控制器
+
+[Api\AccessoriesController::checkout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AccessoriesController.php#L305) 使用 `determineCheckoutTarget()`（L308），**不绕过 Global Scope**：
+
+```php
+public function checkout(AccessoryCheckoutRequest $request, Accessory $accessory)
+{
+    $this->authorize('checkout', $accessory);
+    $target = $this->determineCheckoutTarget();             // L308 ← 受 Global Scope 约束！
+
+    if ((Setting::getSettings()->full_multiple_companies_support == '1')
+        && (! $target->companies()->where('companies.id', $accessory->company_id)->exists())) {
+        return response()->json(Helper::formatStandardApiResponse('error', null, trans('general.error_user_company')));
+    }
+    // ...
+}
+```
+
+**问题**：跨公司目标在 `determineCheckoutTarget()` 的 `findOrFail()` 阶段就被过滤掉，直接抛 `ModelNotFoundException` 返回 404，永远到不了 L310 的 FMCS 检查。这与 Web UI 控制器有相同的歧义问题，但在 API 中更令人困惑（其他 API 端点如 Asset/License/Component/Consumable checkout 都能区分"不存在"和"跨公司"）。
+
+### 17.7 Web UI 单资产 checkout（AssetCheckoutController）：先 findOrFail 后 canCheckoutTo
 
 [AssetCheckoutController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetCheckoutController.php#L68-L183) 流程：
 
 ```php
-public function store(AssetCheckoutRequest $request, $assetId): RedirectResponse
-{
-    $asset = Asset::find($assetId);                               // ← 受 Global Scope 约束
-    $target = $this->determineCheckoutTarget();                  // ← 受 Global Scope 约束（findOrFail）
-    if (! $asset->canCheckoutTo($target)) {                       // ← 显式检查
-        return redirect()->route('hardware.checkout.create', $asset)
-            ->with('error', trans('general.error_checkout_company_mismatch', [...]));
-    }
-    $asset->checkOut($target, ...);
+$asset = Asset::find($assetId);                               // ← 受 Global Scope 约束
+$target = $this->determineCheckoutTarget();                  // ← 受 Global Scope 约束（findOrFail）
+if (! $asset->canCheckoutTo($target)) {                       // ← 显式检查
+    return redirect()->route('hardware.checkout.create', $asset)
+        ->with('error', trans('general.error_checkout_company_mismatch', [...]));
 }
 ```
 
@@ -820,7 +867,7 @@ public function store(AssetCheckoutRequest $request, $assetId): RedirectResponse
 - 如果目标在其他公司：`determineCheckoutTarget()` 中的 `findOrFail()` 抛 `ModelNotFoundException`，catch 后返回 "Target not found"
 - 如果目标在本公司但公司不匹配（如资产是 A 公司、目标用户是 B 公司但用户是当前 admin 所属 B 公司）：`findOrFail()` 成功，但 `canCheckoutTo()` 返回 false，返回清晰的 "Company mismatch" 错误
 
-### 17.5 Web UI 批量 checkout（BulkAssetsController）：先公司一致性检查
+### 17.8 Web UI 批量 checkout（BulkAssetsController）：先公司一致性检查
 
 [BulkAssetsController::storeCheckout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/BulkAssetsController.php#L662-L782) 有独特的 FMCS 检查逻辑：
 
@@ -853,22 +900,25 @@ foreach ($assets as $asset) {
 
 **批量 checkout 的特有限制**：不能将属于不同公司的资产批量 checkout 给同一个目标（即使目标是所有公司都认可的"浮动对象"）。
 
-### 17.6 四种 Checkout 路径对比
+### 17.9 全部 Checkout 路径对比
 
-| 路径 | 控制器/方法 | 目标查找 | Global Scope 绕过 | 公司检查时机 | 跨公司目标时错误 |
+| 路径 | 控制器/方法 | 目标查找 | Global Scope 绕过 | 公司检查 | 跨公司目标时错误 |
 |---|---|---|---|---|---|
-| API 单 checkout | [Api\AssetsController::checkout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L1016) | `Model::withoutGlobalScopes()->find()` | ✅ 三路 | checkoutCompanyMismatchResponse | 明确 "company mismatch" |
-| API 创建/更新 | [Api\AssetsController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L897) | `resolveCheckoutTargetForAssetMutation` | ✅ 三路 | checkoutCompanyMismatchResponse | 明确 "company mismatch" |
-| Web 单 checkout | [AssetCheckoutController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetCheckoutController.php#L68) | `determineCheckoutTarget()` → `findOrFail` | ❌ 无 | canCheckoutTo() | 模糊 "Target not found" |
-| Web 批量 checkout | [BulkAssetsController::storeCheckout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/BulkAssetsController.php#L662) | `determineCheckoutTarget()` → `findOrFail` | ❌ 无 | 先公司一致性 + canCheckoutTo | 模糊 "Target not found" / "跨多公司" |
-| Web 创建资产 | [Assets\AssetsController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L121) | `Model::find()` | ❌ 无 | canCheckoutTo() | 模糊 "Target not found" |
-| Web 更新资产 | [Assets\AssetsController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L395) | 不处理 checkout | — | — | — |
-
-### 17.7 Web UI update：不做 checkout 操作
-
-[Assets\AssetsController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L395-L524) 在更新时**不处理 checkout**，只修改资产属性（含 `Company::getIdForCurrentUser()` 约束 company_id 赋值），因此不涉及目标解析和 Global Scope 绕过。
-
----
+| API Asset checkout | [Api\AssetsController::checkout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L1016) | `withoutGlobalScopes()->find()` | ✅ 三路 | checkoutCompanyMismatchResponse | 明确 "company mismatch" |
+| API Asset 创建/更新 | [Api\AssetsController::resolveCheckoutTargetForAssetMutation()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php#L897) | `withoutGlobalScopes()->find()` | ✅ 三路 | checkoutCompanyMismatchResponse | 明确 "company mismatch" |
+| API Accessory checkout | [Api\AccessoriesController::checkout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AccessoriesController.php#L305) | `determineCheckoutTarget()` | ❌ 无 | companies() 关系检查（但到不了） | 404 "not found" |
+| API License checkout | [Api\LicensesController::checkout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/LicensesController.php#L322) | `withoutGlobalScopes()->find()` | ✅ 两路 | canCheckoutTo() | 明确 "company mismatch" |
+| API LicenseSeat update | [Api\LicenseSeatsController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/LicenseSeatsController.php#L112) | `withoutGlobalScopes()->find()` | ✅ 四路 | 显式 FMCS 检查 | 明确 "company mismatch" |
+| API Component checkout | [Api\ComponentsController::checkout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/ComponentsController.php#L320) | `withoutGlobalScopes()->find()` | ✅ 一路 | canCheckoutTo() | 明确 "company mismatch" |
+| API Consumable checkout | [Api\ConsumablesController::checkout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/ConsumablesController.php#L313) | `withoutGlobalScopes()->find()` | ✅ 一路 | canCheckoutTo() | 明确 "company mismatch" |
+| Web Asset 单 checkout | [AssetCheckoutController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetCheckoutController.php#L68) | `determineCheckoutTarget()` | ❌ 无 | canCheckoutTo() | 模糊 "Target not found" |
+| Web Asset 批量 checkout | [BulkAssetsController::storeCheckout()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/BulkAssetsController.php#L662) | `determineCheckoutTarget()` | ❌ 无 | 公司一致性 + canCheckoutTo | 模糊 "Target not found" / "跨多公司" |
+| Web Accessory checkout | [AccessoryCheckoutController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Accessories/AccessoryCheckoutController.php#L61) | `determineCheckoutTarget()` | ❌ 无 | canCheckoutTo() | 模糊 "Target not found" |
+| Web Component checkout | [ComponentCheckoutController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Components/ComponentCheckoutController.php#L75) | `Asset::find()` 直接查找 | ❌ 无 | canCheckoutTo() | 模糊 "Asset not found" |
+| Web Consumable checkout | [ConsumableCheckoutController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Consumables/ConsumableCheckoutController.php#L71) | `User::find()` 直接查找 | ❌ 无 | canCheckoutTo() | 模糊 "User does not exist" |
+| Web Kit checkout | [CheckoutKitController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Kits/CheckoutKitController.php#L54) | `User::find()` 直接查找 | ❌ 无 | 无（委托 service） | 模糊 "User not found" |
+| Web Asset 创建 | [Assets\AssetsController::store()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L121) | `Model::find()` | ❌ 无 | canCheckoutTo() | 模糊 "Target not found" |
+| Web Asset 更新 | [Assets\AssetsController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Assets/AssetsController.php#L395) | 不处理 checkout | — | — | — |
 
 ## 十八、全仓 withoutGlobalScope(s) 调用完整清单（含方法名与位置）
 
@@ -914,9 +964,9 @@ foreach ($assets as $asset) {
 | [Api\LicenseSeatsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/LicenseSeatsController.php) | `update()` | L179 | `Asset::withoutGlobalScopes()->find(...)` | 同上 |
 | [Api\ComponentsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/ComponentsController.php) | `checkout()` | L320 | `Asset::withoutGlobalScopes()->find(...)` | 组件 checkout 目标解析 |
 | [Api\ConsumablesController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/ConsumablesController.php) | `checkout()` | L313 | `User::withoutGlobalScopes()->find(...)` | 耗材 checkout 目标解析 |
-| [Api\AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `checkout()` | L1019 | `Location::withoutGlobalScopes()->find(...)` | 资产 checkout 目标解析（location） |
-| [Api\AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `checkout()` | L1028 | `Asset::withoutGlobalScopes()->find(...)` | 资产 checkout 目标解析（asset） |
-| [Api\AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `checkout()` | L1037 | `User::withoutGlobalScopes()->find(...)` | 资产 checkout 目标解析（user） |
+| [Api\AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `checkout()` | L1036 | `Location::withoutGlobalScopes()->find(...)` | 资产 checkout 目标解析（location） |
+| [Api\AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `checkout()` | L1042 | `Asset::withoutGlobalScopes()->find(...)` | 资产 checkout 目标解析（asset） |
+| [Api\AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `checkout()` | L1050 | `User::withoutGlobalScopes()->find(...)` | 资产 checkout 目标解析（user） |
 | [Api\AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `resolveCheckoutTargetForAssetMutation()` | L900 | `User::withoutGlobalScopes()->find(...)` | 资产创建/更新时 checkout 目标解析 |
 | [Api\AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `resolveCheckoutTargetForAssetMutation()` | L904 | `Asset::withoutGlobalScopes()->find(...)` | 同上 |
 | [Api\AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/10-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `resolveCheckoutTargetForAssetMutation()` | L908 | `Location::withoutGlobalScopes()->find(...)` | 同上 |
