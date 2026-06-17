@@ -540,9 +540,16 @@ Gate::allows($ability, $arguments)
 | 组件 | 位置 | 作用 |
 |------|------|------|
 | `CompanyableTrait` | [app/Models/Traits/CompanyableTrait.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Traits/CompanyableTrait.php) | 自动注册全局 Scope + 提供 `canCheckoutTo()` |
+| `CompanyableChildTrait` | [app/Models/Traits/CompanyableChildTrait.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Traits/CompanyableChildTrait.php) | 子模型（无 company_id 列）使用，通过父模型间接隔离 |
 | `CompanyableScope` | [app/Models/CompanyableScope.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/CompanyableScope.php) | 全局查询 Scope，委托给 Company::scopeCompanyables |
-| `scopeCompanyables()` | [app/Models/Company.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L372) | 核心过滤逻辑入口 |
+| `CompanyableChildScope` | [app/Models/CompanyableChildScope.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/CompanyableChildScope.php) | 子模型查询 Scope，委托给 Company::scopeCompanyableChildren（通过 whereHas 父模型过滤） |
+| `scopeCompanyables()` | [app/Models/Company.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L372) | 核心过滤入口（FMCS off / SuperUser / CLI 三种跳过条件） |
+| `scopeCompanyablesDirectly()` | [app/Models/Company.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L388) | 三维矩阵过滤：表类型 × 用户公司 × floater 配置 |
+| `scopeCompanyableChildren()` | [app/Models/Company.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L495) | 子模型过滤：whereHas 任一父模型关系 |
+| `scopeUsersByCompanyIds()` | [app/Models/Company.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L474) | 管理员入口：接受显式公司 ID 数组，供 selectlist 下拉二次筛选 |
 | `isCurrentUserHasAccess()` | [app/Models/Company.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L190) | 策略 before 钩子中的访问检查 |
+| `getIdForCurrentUser()` | [app/Models/Company.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L148) | 写入隔离：FormRequest 中覆盖用户提交的 company_id |
+| `getCurrentUserCompanyIds()` | [app/Models/Company.php](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L106) | 从 company_user pivot 表获取当前用户公司 ID 列表 |
 | `null_company_is_floater` | 设置项 | 无公司数据是否对所有用户可见 |
 | `full_multiple_companies_support` | 设置项 | FMCS 总开关 |
 
@@ -1122,15 +1129,87 @@ public static function scopeCompanyables($query, $column = 'company_id', $table_
 }
 ```
 
-**scopeCompanyablesDirectly** 核心过滤 — [Company.php#L388](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L388)：
+**scopeCompanyablesDirectly** 核心过滤 — [Company.php#L388](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L388)
 
-| 表类型 | 过滤逻辑 | 说明 |
-|--------|---------|------|
-| `companies` | `whereIn('companies.id', $companyIds)` 或 `whereNull` | 直接按 ID 过滤 |
-| `users` | `whereIn('users.id', 子查询 company_user)` | 通过 pivot 表多对多过滤 |
-| `action_logs` | `whereIn(company_id) or WhereNull(company_id)` | 全局对象日志对所有公司可见 |
-| 通用表 | `whereIn(company_id, $companyIds)` | 标准 company_id 列过滤 |
-| 通用表 + floater | `whereIn(company_id) or WhereNull(company_id)` | 无公司数据对所有人可见 |
+#### 过滤决策树总览
+
+```
+scopeCompanyablesDirectly($query, $column, $table_name)
+        │
+        ├─ $companyIds = getCurrentUserCompanyIds()  ← 从 company_user pivot 取
+        │
+        ├─ 表 == 'companies'  ──────────────────────────── 分支 1
+        │     ├─ empty($companyIds) → whereNull('companies.id')    （空集）
+        │     └─ else              → whereIn('companies.id', $ids)
+        │
+        ├─ $floater = Setting::null_company_is_floater
+        │
+        ├─ 表 == 'users'  ─────────────────────────────── 分支 2
+        │     ├─ empty($companyIds)
+        │     │     ├─ floater=true  → return $query                （完全不过滤，看见所有人）
+        │     │     └─ floater=false → whereNotIn('users.id', 子查询 company_user)  （只看无公司用户）
+        │     ├─ floater=true → whereIn(子查询) OR orWhereDoesntHave('companies')
+        │     └─ floater=false → whereIn('users.id', 子查询 company_user)
+        │
+        └─ Schema::hasColumn($table, $column)  ──────── 分支 3（通用表 + 兜底）
+              ├─ $table = $table_name.'.' 或 model_table.'.'
+              ├─ empty($companyIds)
+              │     ├─ floater=true  → return $query                （完全不过滤）
+              │     └─ floater=false → whereNull($table.$column)    （只看无公司数据）
+              ├─ 表 == 'action_logs' → whereIn + orWhereNull        （始终包含 NULL，不受 floater 影响）
+              ├─ floater=true → whereIn + orWhereNull
+              └─ floater=false → whereIn
+```
+
+#### 分支 1：`companies` 表自身
+
+当查询目标就是公司表本身时，直接按 ID 过滤，不涉及 company_id 列：
+
+| 条件 | SQL | 结果集 |
+|------|-----|--------|
+| `empty($companyIds)` | `WHERE companies.id IS NULL` | 空集（无公司用户看不到任何公司） |
+| 非空 | `WHERE companies.id IN (?, ?,...)` | 用户所属公司 |
+
+#### 分支 2：`users` 表（多对多 pivot）
+
+用户通过 `company_user` pivot 表与公司关联，不能用 `company_id` 列过滤，必须用子查询：
+
+| `$companyIds` | `floater` | SQL 形态 | 可见范围 |
+|--------------|-----------|----------|----------|
+| 空 | true | 无 WHERE（直接返回 `$query`） | 所有用户（漂浮用户 = 全局可见） |
+| 空 | false | `WHERE users.id NOT IN (SELECT user_id FROM company_user)` | 不属于任何公司的用户 |
+| 非空 | true | `WHERE (users.id IN (SELECT user_id FROM company_user WHERE company_id IN (...)) OR NOT EXISTS (SELECT 1 FROM company_user WHERE user_id = users.id))` | 指定公司用户 + 无公司用户 |
+| 非空 | false | `WHERE users.id IN (SELECT user_id FROM company_user WHERE company_id IN (...))` | 仅指定公司用户 |
+
+> 当 `floater=true` 且用户没有任何公司时，用户就是"漂浮"的，可以看到所有人。这是为了兼容 FMCS 启用前的旧数据。
+
+#### 分支 3：通用表（`Schema::hasColumn` 兜底）
+
+所有有 `company_id` 列的普通模型（assets、licenses、accessories 等）走这个分支。`Schema::hasColumn` 起到**防御性兜底**作用——如果某张表没有 `company_id` 列，直接跳过过滤，不会产生 SQL 错误。
+
+**`$companyIds` 为空时：**
+
+| `floater` | SQL | 可见范围 |
+|-----------|-----|----------|
+| true | 无 WHERE（直接返回 `$query`） | 所有数据 |
+| false | `WHERE table.company_id IS NULL` | 仅无公司数据 |
+
+**`$companyIds` 非空时：**
+
+| 表名 | `floater` | SQL | 说明 |
+|------|-----------|-----|------|
+| `action_logs` | *（忽略）* | `WHERE (company_id IN (...) OR company_id IS NULL)` | **特殊**：NULL 行代表全局对象（如 AssetModel）的日志，始终可见，不受 floater 控制 |
+| 通用表 | true | `WHERE (company_id IN (...) OR company_id IS NULL)` | 本公司数据 + 无公司数据 |
+| 通用表 | false | `WHERE company_id IN (...)` | 仅本公司数据 |
+
+> `action_logs` 的特殊处理是因为很多全局对象（型号、字段集等）本身没有 `company_id`，它们的操作日志 `company_id` 为 NULL。如果按普通规则过滤，这些全局日志会全部消失，所以单独做了 `orWhereNull` 兜底。
+
+#### 兜底行为：表无 `company_id` 列
+
+如果 `Schema::hasColumn($table, $column)` 返回 false，方法什么也不做，直接返回原始 `$query`。这意味着：
+- 没有 `company_id` 列的模型（如 `Location`、`Department` 等）不会被 CompanyableScope 过滤
+- 配合 `isCurrentUserHasAccess` 中的同一句检查，这些模型在策略层也会被放行
+- 这类模型的公司隔离需要依赖其他机制（如父模型的级联过滤）
 
 ### 11.4 CompanyableChildScope 子模型隔离
 
@@ -1262,7 +1341,92 @@ public function syncCompaniesWithLogging(array $companyIds): void
 }
 ```
 
-### 11.7 isCurrentUserHasAccess — 策略层公司访问检查
+### 11.7 scopeUsersByCompanyIds — 管理员按公司 ID 过滤入口
+
+[Company.php#L474](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L474)
+
+#### 定位与设计意图
+
+`scopeUsersByCompanyIds` 是一个**显式调用的管理员入口**，不是全局 Scope。它的设计目的是：
+
+> *"Extracted from controller-level inline logic so the same rule is enforced consistently everywhere users are filtered by a specific set of company IDs (e.g. select2 dropdowns)."*
+
+即：把控制器里按指定公司 ID 过滤用户的逻辑抽成公共方法，确保所有 select2 下拉框、用户筛选等场景的规则一致。
+
+#### 方法签名与核心逻辑
+
+```php
+public static function scopeUsersByCompanyIds($query, array $companyIds): mixed
+{
+    if (Setting::getSettings()->null_company_is_floater) {
+        return $query->where(function ($q) use ($companyIds) {
+            $q->whereHas('companies', fn ($q2) => $q2->whereIn('companies.id', $companyIds))
+                ->orWhereDoesntHave('companies');
+        });
+    }
+
+    return $query->whereHas('companies', fn ($q) => $q->whereIn('companies.id', $companyIds));
+}
+```
+
+#### floater 模式对比
+
+| `null_company_is_floater` | 过滤逻辑 | 结果集 |
+|---------------------------|---------|--------|
+| `true` | `whereHas('companies', whereIn) OR orWhereDoesntHave('companies')` | 指定公司的用户 + 无任何公司的"漂浮"用户 |
+| `false` | `whereHas('companies', whereIn)` | 仅指定公司的用户 |
+
+> 注意：该方法**没有** `empty($companyIds)` 的空值分支，调用者需自行确保 `$companyIds` 非空。若传入空数组，`whereIn` 会产生 SQL 错误或空结果。
+
+#### 与 `scopeCompanyablesDirectly`（users 分支）的区别
+
+| 维度 | `scopeCompanyablesDirectly`（users 分支） | `scopeUsersByCompanyIds` |
+|------|------------------------------------------|-------------------------|
+| **公司 ID 来源** | `getCurrentUserCompanyIds()`（当前登录用户的公司） | 显式传入的 `$companyIds` 参数 |
+| **查询方式** | `whereIn` + `company_user` 子查询 | `whereHas` Eloquent 关系查询 |
+| **空 companyIds 处理** | 有分支（floater 全放行 / 仅无公司用户） | 无分支（调用方负责判空） |
+| **调用方式** | 全局 Scope 自动调用 / 手动调用 | 仅手动调用 |
+| **FMCS + SuperUser 检查** | 由外层 `scopeCompanyables` 负责 | **没有**，调用时需自行确保安全范围 |
+
+#### 调用场景：UsersController@selectlist 双层过滤
+
+目前唯一的调用点在 [UsersController@selectlist](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Http/Controllers/Api/UsersController.php#L381)，采用**双层过滤**安全设计：
+
+```php
+// 第一层：scopeCompanyables — 基础安全边界
+//   - FMCS 未启用 → 不过滤
+//   - SuperUser → 不过滤
+//   - 普通用户 → 限制在自己的公司范围内
+$users = Company::scopeCompanyables($users, 'company_id', 'users');
+
+// 第二层：scopeUsersByCompanyIds — 按前端参数进一步缩小范围
+//   - 仅在 FMCS 启用 + 请求带 companyId 参数时触发
+//   - companyId 来自前端 select2 下拉的 data-company-ids 属性
+if ((Setting::getSettings()->full_multiple_companies_support == '1')
+    && $request->filled('companyId')) {
+    $companyIds = array_values(array_filter(
+        array_map('intval', explode(',', $request->input('companyId')))
+    ));
+    if (! empty($companyIds)) {
+        $users = Company::scopeUsersByCompanyIds($users, $companyIds);
+    }
+}
+```
+
+**双层过滤的安全意义**：
+1. **第一层 `scopeCompanyables` 是安全底线**：无论前端传什么 `companyId`，当前用户能看到的用户范围永远不会超出自己所属的公司。SuperUser 不受此限。
+2. **第二层 `scopeUsersByCompanyIds` 是功能层**：在安全范围内，根据前端传入的公司 ID 进一步筛选，用于实现"只看某公司用户"的下拉筛选体验。
+3. **越权防护**：即使普通用户篡改请求传入不属于自己的公司 ID，第一层已经把数据限制住了，第二层只是在受限集合里做子集筛选，不会产生越权泄露。
+
+#### 适用扩展场景
+
+根据方法注释的设计意图，该方法未来可复用于：
+- 用户选择器下拉框（select2 / selectlist）
+- 报表按公司筛选用户
+- 资产分配时的用户候选列表
+- 任何需要"按指定公司 ID 过滤用户"的业务场景
+
+### 11.8 isCurrentUserHasAccess — 策略层公司访问检查
 
 [Company.php#L190](file:///d:/fz/0601-2/solo-dogfeeding/code/9-snipe-it/app/Models/Company.php#L190)：
 
@@ -1285,7 +1449,7 @@ Company::isCurrentUserHasAccess($companyable)
 
 > 此方法在 `SnipePermissionsPolicy@before` 钩子中被调用，是策略层公司访问控制的核心。
 
-### 11.8 读取隔离 vs 写入隔离
+### 11.9 读取隔离 vs 写入隔离
 
 | 隔离类型 | 机制 | 触发点 | 作用 |
 |---------|------|--------|------|
@@ -1294,7 +1458,7 @@ Company::isCurrentUserHasAccess($companyable)
 | **策略隔离** | Company::isCurrentUserHasAccess() | SnipePermissionsPolicy@before() | 策略检查时拒绝跨公司操作 |
 | **借出隔离** | canCheckoutTo() / canReceiveFromCompany() | 控制器借出逻辑 | 资产只能借出给同公司用户 |
 
-### 11.9 FMCS 配置项影响表
+### 11.10 FMCS 配置项影响表
 
 | 配置项 | 值 | 影响 |
 |--------|---|------|
@@ -1303,7 +1467,7 @@ Company::isCurrentUserHasAccess($companyable)
 | `null_company_is_floater` | `0` | 无公司数据仅对无公司用户可见 |
 | `null_company_is_floater` | `1` | 无公司数据对所有用户可见（浮动） |
 
-### 11.10 完整公司隔离调用链路
+### 11.11 完整公司隔离调用链路
 
 ```
 ┌─ 读取隔离 ────────────────────────────────────────────────┐
