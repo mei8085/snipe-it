@@ -2,7 +2,12 @@
 
 ## 概述
 
-Snipe-IT 资产盘点系统的权限判定由**权限注册表**、**策略类**与**控制器中间件**三者协同完成，形成了一个完整的权限判定链路。系统基于 Laravel 的 Authorization 系统构建，通过 Gate 门面对象进行统一调度。
+Snipe-IT 资产盘点系统的权限判定由**权限注册表**、**策略类**、**控制器中间件**、**API 鉴权**、**Form Request 授权**与**公司隔离 Scope** 六部分协同完成，形成了一个完整的多维度权限判定链路。系统基于 Laravel 的 Authorization 系统构建，通过 Gate 门面对象进行统一调度。
+
+除了基础的权限检查外，系统还通过：
+- **Passport/PAT** 实现 API 令牌鉴权
+- **Form Request authorize()** 在验证前进行权限拦截
+- **CompanyableTrait + Global Scope** 实现跨公司数据隔离
 
 ## 一、权限定义：权限注册表
 
