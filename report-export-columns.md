@@ -722,7 +722,323 @@ if ($request->filled('location_address')) {
 - **代码位置**：[custom.blade.php:627](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L627)（UI）, [L517](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L517)（硬编码）
 - **影响**：用户勾选无效，功能名存实亡
 
-## 五、关键文件索引
+---
+
+## 五、导出数量统计：代码级精确核准
+
+### 5.1 前端 checkbox 精确统计
+
+[custom.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php) 中共有 **49 个固定 checkbox** + N 个动态自定义字段 checkbox。
+
+**按位置与用途分类**：
+
+| 分类 | 数量 | 位置 | 用途 |
+|------|------|------|------|
+| 资产字段 checkbox | 31 | `#included_fields_wrapper` 内 [L100-L247](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L100-L247) | 控制资产数据列导出 |
+| 用户字段 checkbox | 15 | `#included_fields_wrapper` 内 [L255-L328](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L255-L328) | 控制借用人数据列导出 |
+| 模板共享 checkbox | 1 | `#included_fields_wrapper` 外 [L80](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L80) | `is_shared`（仅在编辑模板时显示） |
+| 排除归档 checkbox | 1 | `#included_fields_wrapper` 外 [L621](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L621) | `exclude_archived`（筛选参数，不产生导出列） |
+| BOM 选项 checkbox | 1 | `#included_fields_wrapper` 外 [L627](file:///d:/fz/0601-2/solo-dogfeeding/code/26/snipe-it/resources/views/reports/custom.blade.php#L627) | `use_bom`（后端不读取，硬编码输出） |
+| 全选控制 checkbox | 1 | `#included_fields_wrapper` 内 [L95](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L95) | `checkAll`（JS 控制，不提交数据） |
+| 动态自定义字段 | N | `#included_fields_wrapper` 内 [L336-L343](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L336-L343) | `@foreach $customfields` 循环生成 |
+
+**49 个固定 checkbox 的完整清单**：
+
+| 序号 | name 属性 | 显示标签 | 所属分类 | 是否产生导出列 |
+|------|----------|---------|---------|--------------|
+| 1 | `is_shared` | Share template | 模板选项 | 有表头无数据（Bug） |
+| 2 | `id` | ID | 资产字段 | 1 列 |
+| 3 | `company` | Company | 资产字段 | 1 列 |
+| 4 | `asset_tag` | Asset Tag | 资产字段 | 1 列 |
+| 5 | `asset_name` | Name | 资产字段 | 1 列 |
+| 6 | `manufacturer` | Manufacturer | 资产字段 | 1 列 |
+| 7 | `model` | Model | 资产字段 | **2 列**（名称+编号） |
+| 8 | `category` | Category | 资产字段 | 1 列 |
+| 9 | `serial` | Serial | 资产字段 | 1 列 |
+| 10 | `purchase_date` | Purchase Date | 资产字段 | 1 列 |
+| 11 | `purchase_cost` | Purchase Cost | 资产字段 | 1 列 |
+| 12 | `eol` | EOL Date | 资产字段 | 1 列 |
+| 13 | `warranty` | Warranty | 资产字段 | **2 列**（月数+到期日） |
+| 14 | `depreciation` | Depreciation | 资产字段 | **3 列**（账面价值+差额+折旧日期） |
+| 15 | `order` | Order | 资产字段 | 1 列 |
+| 16 | `supplier` | Supplier | 资产字段 | 1 列 |
+| 17 | `location` | Location | 资产字段 | 1 列 |
+| 18 | `location_address` | Address | 资产字段 | **6 列**（address,address2,city,state,country,zip） |
+| 19 | `rtd_location` | Default Location | 资产字段 | 1 列 |
+| 20 | `rtd_location_address` | Address | 资产字段 | **6 列**（同上） |
+| 21 | `status` | Status | 资产字段 | 1 列 |
+| 22 | `checkout_date` | Checkout Date | 资产字段 | 1 列 |
+| 23 | `checkin_date` | Last Checkin Date | 资产字段 | 1 列 |
+| 24 | `expected_checkin` | Expected Checkin | 资产字段 | 1 列 |
+| 25 | `created_at` | Created At | 资产字段 | 1 列 |
+| 26 | `updated_at` | Updated At | 资产字段 | 1 列 |
+| 27 | `deleted_at` | Deleted | 资产字段 | 1 列 |
+| 28 | `last_audit_date` | Last Audit | 资产字段 | 1 列 |
+| 29 | `next_audit_date` | Next Audit Date | 资产字段 | 1 列 |
+| 30 | `notes` | Notes | 资产字段 | 1 列 |
+| 31 | `url` | URL | 资产字段 | 1 列 |
+| 32 | `assigned_to` | Assigned To | 用户字段 | **2 列**（名称+类型） |
+| 33 | `username` | Username | 用户字段 | 1 列 |
+| 34 | `user_company` | User Company | 用户字段 | 1 列 |
+| 35 | `email` | Email | 用户字段 | 1 列 |
+| 36 | `employee_num` | Employee No. | 用户字段 | 1 列 |
+| 37 | `manager` | Manager | 用户字段 | 1 列 |
+| 38 | `department` | Department | 用户字段 | 1 列 |
+| 39 | `title` | Job Title | 用户字段 | 1 列 |
+| 40 | `phone` | Phone | 用户字段 | 1 列 |
+| 41 | `user_address` | Address | 用户字段 | 1 列 |
+| 42 | `user_city` | City | 用户字段 | 1 列 |
+| 43 | `user_state` | State | 用户字段 | 1 列 |
+| 44 | `user_country` | Country | 用户字段 | 1 列 |
+| 45 | `user_zip` | Zip | 用户字段 | 1 列 |
+| 46 | `target_notes` | Target Notes | 用户字段 | 1 列 |
+| 47 | `exclude_archived` | Exclude Archived | 筛选选项 | **0 列**（不产生导出列） |
+| 48 | `use_bom` | BOM | 选项 | **0 列**（后端不读取） |
+| 49 | `checkAll` | Select All | 控制按钮 | **0 列**（JS 控制） |
+
+### 5.2 后端 `$request->filled()` 字段精确统计
+
+[ReportsController.php::postCustom()](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L501-L1172) 中用于**表头生成**的 `$request->filled()` 调用共 **46 次**（L521-L714）。
+
+这 46 个字段分为两大类：
+
+| 分类 | 数量 | 行号范围 | 说明 |
+|------|------|---------|------|
+| 资产列字段 | 30 | L521-L714 | 含 is_shared（1列）、1:1 映射（24列）、1:N 映射（5个 → 15列） |
+| 用户列字段 | 16 | L613-L672 | 含 assigned_to（1:2 映射）、1:1 映射（15列） |
+
+**46 个字段的精确清单（按代码顺序）**：
+
+| # | 字段名 | 代码行 | 一对多 | 导出列数 | 表头文本 |
+|---|--------|-------|--------|---------|---------|
+| 1 | `is_shared` | L521 | - | 1 | Share template |
+| 2 | `id` | L525 | - | 1 | ID |
+| 3 | `company` | L529 | - | 1 | Company |
+| 4 | `asset_name` | L533 | - | 1 | Name |
+| 5 | `asset_tag` | L537 | - | 1 | Asset Tag |
+| 6 | `model` | L541 | 1:2 | 2 | Model, Model No. |
+| 7 | `category` | L546 | - | 1 | Category |
+| 8 | `manufacturer` | L550 | - | 1 | Manufacturer |
+| 9 | `serial` | L554 | - | 1 | Serial |
+| 10 | `purchase_date` | L557 | - | 1 | Purchase Date |
+| 11 | `purchase_cost` | L561 | - | 1 | Purchase Cost |
+| 12 | `eol` | L565 | - | 1 | EOL |
+| 13 | `warranty` | L569 | 1:2 | 2 | Warranty, Warranty Expires |
+| 14 | `depreciation` | L574 | 1:3 | 3 | Book Value, Diff, Fully Depreciated |
+| 15 | `order` | L580 | - | 1 | Order |
+| 16 | `supplier` | L584 | - | 1 | Supplier |
+| 17 | `location` | L588 | - | 1 | Location |
+| 18 | `location_address` | L591 | 1:6 | 6 | Address, Address, City, State, Country, Zip |
+| 19 | `rtd_location` | L600 | - | 1 | Default Location |
+| 20 | `rtd_location_address` | L604 | 1:6 | 6 | Address, Address, City, State, Country, Zip |
+| 21 | `assigned_to` | L613 | 1:2 | 2 | Checked Out To, Type |
+| 22 | `username` | L618 | - | 1 | Username |
+| 23 | `user_company` | L622 | - | 1 | User Company |
+| 24 | `email` | L626 | - | 1 | Email |
+| 25 | `employee_num` | L630 | - | 1 | Employee No. |
+| 26 | `manager` | L634 | - | 1 | Manager |
+| 27 | `department` | L638 | - | 1 | Department |
+| 28 | `title` | L642 | - | 1 | Job Title |
+| 29 | `phone` | L646 | - | 1 | Phone |
+| 30 | `user_address` | L650 | - | 1 | User Address |
+| 31 | `user_city` | L654 | - | 1 | User City |
+| 32 | `user_state` | L658 | - | 1 | User State |
+| 33 | `user_country` | L662 | - | 1 | User Country |
+| 34 | `user_zip` | L666 | - | 1 | User Zip |
+| 35 | `target_notes` | L670 | - | 1 | Target Notes |
+| 36 | `status` | L674 | - | 1 | Status |
+| 37 | `checkout_date` | L678 | - | 1 | Checkout Date |
+| 38 | `checkin_date` | L682 | - | 1 | Last Checkin Date |
+| 39 | `expected_checkin` | L686 | - | 1 | Expected Checkin |
+| 40 | `created_at` | L690 | - | 1 | Created At |
+| 41 | `updated_at` | L694 | - | 1 | Updated At |
+| 42 | `deleted_at` | L698 | - | 1 | Deleted |
+| 43 | `last_audit_date` | L702 | - | 1 | Last Audit |
+| 44 | `next_audit_date` | L706 | - | 1 | Next Audit Date |
+| 45 | `notes` | L710 | - | 1 | Notes |
+| 46 | `url` | L714 | - | 1 | URL |
+
+**后端不读取的 3 个前端 checkbox**：
+
+| 前端 checkbox | 不读取原因 | 实际作用 |
+|--------------|-----------|---------|
+| `checkAll` | 不是数据字段 | JS 控制 `#included_fields_wrapper` 内所有 checkbox |
+| `exclude_archived` | 用作筛选参数 | L846: `$assets->notArchived()` |
+| `use_bom` | 后端完全忽略 | BOM 硬编码输出，不读取请求参数 |
+
+### 5.3 动态自定义字段的代码逻辑与数量来源
+
+自定义字段的数量是**运行时动态**决定的，无法在代码中硬编码一个数字。
+
+**数据来源链路**：
+
+```
+数据库 custom_fields 表
+        ↓
+CustomField::get() [L508]
+        ↓
+$customfields 变量传递给 StreamedResponse 闭包
+        ↓
+表头：foreach ($customfields as $customfield) [L718-L722]
+  → $request->input($customfield->db_column_name()) == '1' 判断
+  → $header[] = $customfield->name
+        ↓
+数据行：foreach ($customfields as $customfield) [L1135-L1146]
+  → $request->filled($customfield->db_column_name()) 判断
+  → $row[] = $asset->$column_name（加密字段需 Gate 权限 + 解密）
+```
+
+**关键代码**：
+
+表头生成 [L718-L722](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L718-L722)：
+```php
+foreach ($customfields as $customfield) {
+    if ($request->input($customfield->db_column_name()) == '1') {
+        $header[] = $customfield->name;
+    }
+}
+```
+
+数据行生成 [L1135-L1146](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1135-L1146)：
+```php
+foreach ($customfields as $customfield) {
+    $column_name = $customfield->db_column_name();
+    if ($request->filled($customfield->db_column_name())) {
+        $value = $asset->$column_name;
+        if (($customfield->field_encrypted == '1') && Gate::allows('assets.view.encrypted_custom_fields')) {
+            $value = Helper::gracefulDecrypt($customfield, $value);
+        }
+        $row[] = $value;
+    }
+}
+```
+
+**前端动态生成** [L332-L343](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L332-L343)：
+```blade
+@if ($customfields->count() > 0)
+    <h2>{{ trans('admin/custom_fields/general.custom_fields') }}</h2>
+    @foreach ($customfields as $customfield)
+        <label class="form-control">
+            <input type="checkbox" name="{{ $customfield->db_column_name() }}" value="1"
+                   @checked($template->checkmarkValue($customfield->db_column_name())) />
+            {{ $customfield->name }}
+        </label>
+    @endforeach
+@endif
+```
+
+**注意差异**：前端 checkbox 使用 `name="{{ $customfield->db_column_name() }}"`，其中 `db_column_name()` 返回的是 `db_column` 属性值（如 `_snipeit_mac_address_1`），而非字段 ID。
+
+### 5.4 Presenter 定义文件的列配置数量
+
+Presenter 列配置用于**前端 Bootstrap Table 导出**，与后端 CSV 导出是两套独立体系。
+
+**AssetPresenter（资产列表）** — 共 **30 个固定列 + N 个动态自定义字段列 + 2 个操作列**：
+
+| 列类型 | 数量 | field 名称 |
+|--------|------|-----------|
+| 功能列 | 2 | checkbox, checkincheckout |
+| 操作列 | 1 | actions |
+| 资产固定列 | 27 | id, asset_tag, name, company, image, serial, model, model_number, category, status, assigned_to, employee_number, jobtitle, location, rtd_location, manufacturer, supplier, purchase_date, age, purchase_cost, book_value, order_number, eol, asset_eol_date, warranty_months, warranty_expires, requestable |
+| 扩展列 | 4 | notes, checkout_counter, checkin_counter, requests_counter |
+| 管理列 | 2 | created_by, created_at |
+| 时间列 | 5 | updated_at, deleted_at(条件), last_checkout, last_checkin, expected_checkin |
+| 审计列 | 2 | last_audit_date, next_audit_date |
+| 标志列 | 1 | byod |
+| 自定义字段 | N | 动态（CustomField::whereHas('fieldset', ...)->get()） |
+
+**DepreciationReportPresenter（折旧报表）** — 共 **22 个固定列**：
+
+field: company, category, name, asset_tag, model, model_number, serial, depreciation, number_of_months, status, checked_out_to, location, manufacturer, supplier, purchase_date, currency, purchase_cost, order_number, eol, book_value, monthly_depreciation, diff, warranty_expires
+
+**其他 Presenter 文件列表**（29 个，每个含 `dataTableLayout()` 方法定义各自的列配置）：
+
+| Presenter 文件 | 对应功能 |
+|---------------|---------|
+| [AssetPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/AssetPresenter.php) | 资产列表 |
+| [DepreciationReportPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/DepreciationReportPresenter.php) | 折旧报表 |
+| [AccessoryPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/AccessoryPresenter.php) | 配件列表 |
+| [AssetAuditPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/AssetAuditPresenter.php) | 资产审计 |
+| [AssetModelPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/AssetModelPresenter.php) | 资产型号 |
+| [CategoryPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/CategoryPresenter.php) | 分类 |
+| [CompanyPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/CompanyPresenter.php) | 公司 |
+| [ComponentPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/ComponentPresenter.php) | 组件 |
+| [ConsumablePresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/ConsumablePresenter.php) | 耗材 |
+| [CustomFieldPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/CustomFieldPresenter.php) | 自定义字段 |
+| [CustomFieldsetPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/CustomFieldsetPresenter.php) | 自定义字段集 |
+| [DepartmentPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/DepartmentPresenter.php) | 部门 |
+| [DepreciationPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/DepreciationPresenter.php) | 折旧 |
+| [GroupPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/GroupPresenter.php) | 用户组 |
+| [HistoryPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/HistoryPresenter.php) | 活动日志 |
+| [LabelPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/LabelPresenter.php) | 标签 |
+| [LicensePresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/LicensePresenter.php) | 许可证 |
+| [LicenseSeatPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/LicenseSeatPresenter.php) | 许可证席位 |
+| [LocationPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/LocationPresenter.php) | 位置 |
+| [MaintenancesPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/MaintenancesPresenter.php) | 维护 |
+| [MaintenanceTypePresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/MaintenanceTypePresenter.php) | 维护类型 |
+| [ManufacturerPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/ManufacturerPresenter.php) | 制造商 |
+| [PredefinedKitPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/PredefinedKitPresenter.php) | 预定义套件 |
+| [StatusLabelPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/StatusLabelPresenter.php) | 状态标签 |
+| [SupplierPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/SupplierPresenter.php) | 供应商 |
+| [UserPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/UserPresenter.php) | 用户 |
+| [UploadedFilesPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/UploadedFilesPresenter.php) | 上传文件 |
+| [ActionlogPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/ActionlogPresenter.php) | 操作日志 |
+
+### 5.5 全部勾选时的最终导出列数计算
+
+**后端 CSV 导出（自定义报表）全部勾选时的列数**：
+
+| 计算项 | 数量 | 说明 |
+|--------|------|------|
+| 一对一映射字段 | 39 | 46 - 6（一对多）- 1（is_shared 有表头无数据） |
+| `model` 多出的列 | +1 | model_number |
+| `warranty` 多出的列 | +1 | warranty_expires |
+| `depreciation` 多出的列 | +2 | diff + fully_depreciated |
+| `location_address` 多出的列 | +5 | address2 + city + state + country + zip |
+| `rtd_location_address` 多出的列 | +5 | 同上 |
+| `assigned_to` 多出的列 | +1 | type |
+| `is_shared` | +1 | 有表头列但无数据（Bug：导致错位） |
+| 动态自定义字段 | +N | 由 `CustomField::get()` 数量决定 |
+
+**精确计算公式**：
+
+```
+导出列数 = 39(1:1) + 1(model额外) + 1(warranty额外) + 2(depreciation额外)
+         + 5(location_address额外) + 5(rtd_location_address额外) 
+         + 1(assigned_to额外) + 1(is_shared表头) + N(自定义字段)
+         = 39 + 15 + 1(is_shared) + N
+         = 55 + N
+```
+
+**但需注意 is_shared Bug**：由于 `is_shared` 在数据行中未实现（[L730-L733](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L730-L733)），实际数据行只有 54 + N 列，表头有 55 + N 列，**差 1 列导致全部数据错位**。
+
+**不勾选 is_shared 时的正确列数**：
+
+```
+导出列数 = 54 + N（表头与数据行完全对齐）
+```
+
+### 5.6 数量统计总结对照表
+
+| 统计维度 | 数量 | 来源代码 |
+|---------|------|---------|
+| 前端固定 checkbox | 49 | [custom.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php) |
+| 前端数据列 checkbox | 46 | 49 - 1(checkAll) - 1(exclude_archived) - 1(use_bom) |
+| 前端资产字段 checkbox | 31 | L100-L247 |
+| 前端用户字段 checkbox | 15 | L255-L328 |
+| 前端动态自定义字段 checkbox | N | L336-L343（@foreach） |
+| 后端表头 `$request->filled()` | 46 | [ReportsController.php L521-L714](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L521-L714) |
+| 后端数据行 `$request->filled()` | 45 | 同上，排除 is_shared（L730-L733 空实现） |
+| 后端筛选条件 `$request->filled()` | 17+ | L739-L846（by_location_id 等，不产生导出列） |
+| 一对多映射字段 | 6 | model, warranty, depreciation, location_address, rtd_location_address, assigned_to |
+| 一对多额外列数合计 | 15 | 1+1+2+5+5+1 |
+| 全部勾选导出列数（不含 is_shared） | 54 + N | 39(1:1) + 15(1:N额外) + N |
+| 全部勾选导出列数（含 is_shared） | 55 + N（表头错位） | 表头 55+N 列，数据 54+N 列 |
+| AssetPresenter 固定列 | 30+2 操作 | [AssetPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/AssetPresenter.php) |
+| DepreciationReportPresenter 列 | 22 | [DepreciationReportPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/DepreciationReportPresenter.php) |
+| Presenter 文件总数 | 29 | [app/Presenters/](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Presenters/) |
+
+## 六、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
