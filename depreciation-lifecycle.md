@@ -348,7 +348,7 @@ if ($request->filled('depreciation_id')) {
 }
 ```
 
-### 5.6 折旧报告归档筛选四路径对比
+### 5.6 折旧报告归档筛选三路径对比
 
 折旧报告的前端入口在 [depreciation.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/resources/views/reports/depreciation.blade.php)，默认数据 URL 为：
 ```
@@ -364,13 +364,38 @@ Route::get('reports/depreciation',
 
 **关键洞察：折旧报告复用了 Api/AssetsController 的同一个 `index()` 方法，通过路由名识别上下文切换行为。**
 
+#### 关于"无折旧配置资产"的精确定义
+
+"无折旧配置"在代码中有两层过滤，必须同时满足才会计算并显示账面价值：
+
+**第一层（查询层，L173-L176）：**
+```php
+if ($filter_non_deprecable_assets) {
+    $non_deprecable_models = AssetModel::select('id')->whereNotNull('depreciation_id')->get();
+    $assets->InModelList($non_deprecable_models->toArray());
+}
+```
+过滤掉资产型号中 `depreciation_id IS NULL` 的所有资产。这层在 switch 之前执行，对所有三条 API 路径都生效。
+
+**第二层（Transformer 层，DepreciationReportTransformer.php L66）：**
+```php
+if (($asset->model) && ($asset->model->depreciation) && ($asset->model->depreciation->months !== 0)) {
+    // 计算账面价值
+} elseif ($asset->model->eol !== null) {
+    // 仅计算 monthly_depreciation（无账面价值和 diff）
+}
+```
+即使通过了第一层过滤，如果折旧规则的 `months = 0`，也不会计算账面价值；此时若型号有 EOL（使用年限）字段，则回退到只计算 monthly_depreciation。
+
+---
+
 #### 路径一：默认报告（无 status_type 参数）
 
 对应前端页面直接访问 `GET /reports/depreciation`。
 
 [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) 执行流程：
 1. L85 路由名匹配 → `$filter_non_deprecable_assets = true`
-2. L173-L176 过滤无折旧配置的资产型号
+2. L173-L176 过滤无折旧配置的资产型号（第一层过滤）
 3. L227-L232 未传入 `status_type` → `$status_type_key = null`
 4. L234 switch 进入 `default` 分支
 5. L287-L299 根据 `show_archived_in_list` 决定归档资产是否显示：
@@ -389,11 +414,21 @@ default:
     }
 ```
 
-**默认报告的归档行为：**
-- `show_archived_in_list = 0`（默认值，[SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) L115）→ **不显示归档资产**
+**show_archived_in_list 开关的生效条件（L287）：**
+```php
+if ((! $request->filled('status_id')) && ($settings->show_archived_in_list != '1'))
+```
+两个条件必须同时满足：
+1. **未显式指定 `status_id`**（指定了具体状态 ID 则不过滤）
+2. **`show_archived_in_list != '1'`**（开关关闭）
+
+开关在 [SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) L115 写入，默认值为 `'0'`。
+
+**默认报告的完整行为：**
+- `show_archived_in_list = 0`（默认）→ **不显示归档资产**
 - `show_archived_in_list = 1` → **显示归档资产**
-- 无论开关如何，**不显示已软删资产**（无 `withTrashed()` 调用）
-- **不显示无折旧配置的资产**（被 L173-L176 过滤）
+- 无论开关如何，**不显示已软删资产**（无 `withTrashed()` 调用，受 SoftDeletes 全局 Scope 限制）
+- 经过第一层和第二层过滤后，才计算并显示账面价值
 
 #### 路径二：显式归档筛选（?status_type=Archived）
 
@@ -412,36 +447,12 @@ case 'Archived':
 ```
 
 **显式归档筛选的行为：**
-- **仅显示归档资产**（`archived = 1`）
-- **不受 `show_archived_in_list` 影响**（switch 已匹配 `case 'Archived'`，不进入 default）
+- **仅显示归档资产**（`archived = 1`，且 `deployable = 0` 且 `pending = 0`，确保"纯归档"状态）
+- **不受 `show_archived_in_list` 影响**（switch 已匹配 `case 'Archived'`，不进入 default 分支，因此开关逻辑不执行）
 - **不显示已软删资产**（无 `withTrashed()` 调用）
-- **不显示无折旧配置的资产**（被 L173-L176 过滤）
-- **必须同时满足** `deployable = 0` 和 `pending = 0`，确保是"纯归档"状态
+- 经过第一层和第二层折旧过滤后，才计算并显示账面价值
 
-#### 路径三：显示归档开关（show_archived_in_list）
-
-该开关在 [SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) L115 写入：
-```php
-$setting->show_archived_in_list = $request->input('show_archived_in_list', '0');
-```
-
-**生效条件（L287）：**
-```php
-if ((! $request->filled('status_id')) && ($settings->show_archived_in_list != '1'))
-```
-
-两个条件必须同时满足：
-1. **未显式指定 `status_id`**（如果指定了具体状态 ID，不过滤）
-2. **`show_archived_in_list != '1'`**（开关关闭）
-
-**开关的作用范围：**
-- ✅ 影响资产列表（`api.hardware.index`）
-- ✅ 影响默认折旧报告（`api.depreciation-report.index` 无 status_type）
-- ❌ 不影响显式 `status_type=Archived`（switch 匹配后绕过 default）
-- ❌ 不影响显式 `status_type=Deleted`
-- ❌ 不影响其他 status_type 过滤
-
-#### 路径四：已删除资产筛选（?status_type=Deleted）
+#### 路径三：已删除资产筛选（?status_type=Deleted）
 
 对应 API 调用 `GET /api/reports/depreciation?status_type=Deleted`。
 
@@ -454,36 +465,60 @@ case 'Deleted':
 
 **已删除资产筛选的行为：**
 - **仅显示已软删资产**（`deleted_at IS NOT NULL`）
-- **不 JOIN status_labels**（代码中没有 JOIN），因此**不按 archived 过滤**
-- **不显示无折旧配置的资产**（被 L173-L176 过滤，这层过滤在 switch 之前执行）
-- 归档状态不影响——已软删资产无论是否归档都会显示
+- **不 JOIN status_labels**（代码中没有 JOIN），因此**完全不考虑 archived/pending/deployable 状态**——已软删资产无论是否归档、是否可部署都会显示
+- **不受 `show_archived_in_list` 影响**（不进入 default 分支）
+- 经过第一层和第二层折旧过滤后，才计算并显示账面价值
 
-#### 四路径对比总表
+---
 
-| 路径 | URL 参数 | 归档资产 | 已软删资产 | 无折旧资产 | 受 show_archived_in_list 影响？ |
-|------|---------|---------|-----------|-----------|--------------------------------|
-| 默认报告 | 无 | ✅/❌ 取决于开关 | ❌ 不显示 | ❌ 不显示 | ✅ 是 |
-| 显式归档 | `?status_type=Archived` | ✅ 仅显示归档 | ❌ 不显示 | ❌ 不显示 | ❌ 否 |
-| 开关打开 | `show_archived_in_list=1` | ✅ 全部显示 | ❌ 不显示 | ❌ 不显示 | ✅ 是（这就是开关本身） |
-| 已删除 | `?status_type=Deleted` | ⚠️ 忽略归档状态 | ✅ 仅显示已删 | ❌ 不显示 | ❌ 否 |
+#### 路径四（独立）：CSV 导出
 
-#### 账面价值显示的一致性
+CSV 导出不走 API 路径，而是走 [ReportsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/ReportsController.php) 的 `exportDeprecationReport()` 方法（L174-L245）。
 
-无论哪条路径，一旦资产被查询出来，账面价值计算逻辑**完全相同**：
-
-[DepreciationReportTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/DepreciationReportTransformer.php) L66-L72, L103：
+**核心查询（L195-L197）：**
 ```php
-if (($asset->model) && ($asset->model->depreciation) && ($asset->model->depreciation->months !== 0)) {
-    $depreciated_value      = Helper::formatCurrencyOutput($asset->getDepreciatedValue());
-    $monthly_depreciation   = Helper::formatCurrencyOutput($asset->getMonthlyDepreciation());
-    $diff                   = Helper::formatCurrencyOutput(($asset->purchase_cost - $asset->getDepreciatedValue()));
-}
+Asset::with('model', 'assignedTo', 'status', 'defaultLoc', 'assetlog')
+    ->orderBy('created_at', 'DESC')
+    ->chunk(500, function ($assets) use ($handle, $formatter) {
 ```
+
+**CSV 导出的关键差异：**
+- ❌ **不过滤无折旧配置资产**（无 L173-L176 的 AssetModel 过滤）
+- ❌ **不按 show_archived_in_list 过滤归档**（无 switch 和 default 分支）
+- ❌ **不接受 status_type 参数**（硬编码查询）
+- ❌ **不显示已软删资产**（无 `withTrashed()` 调用，受 SoftDeletes 全局 Scope 限制）
+- ✅ 账面价值计算（L229）：`$asset->getDepreciatedValue()`，与 API 路径使用完全相同的方法
+
+**但注意：** 即使 CSV 导出不过滤无折旧配置的资产，`getDepreciatedValue()` 内部仍会检查折旧规则——若折旧规则不存在或 months=0，将返回 `purchase_cost`（见 Depreciable.php L43-L48），而非 null。
+
+---
+
+#### 四路径对比总表（统一版）
+
+| 路径 | 触发方式 | 归档资产 | 已软删资产 | 无折旧配置资产 | 受 show_archived_in_list 影响？ |
+|------|---------|---------|-----------|--------------|--------------------------------|
+| 默认报告 | `GET /api/reports/depreciation`（无参数） | ✅/❌ 取决于开关 | ❌ 不显示 | ❌ 两层过滤后排除 | ✅ 是 |
+| 显式归档 | `GET /api/reports/depreciation?status_type=Archived` | ✅ 仅显示归档 | ❌ 不显示 | ❌ 两层过滤后排除 | ❌ 否 |
+| 已删除 | `GET /api/reports/depreciation?status_type=Deleted` | ⚠️ 完全忽略归档状态 | ✅ 仅显示已删 | ❌ 两层过滤后排除 | ❌ 否 |
+| CSV 导出 | `GET /reports/depreciation/export` | ✅ 全部显示 | ❌ 不显示 | ✅ 显示（返回 purchase_cost） | ❌ 否 |
+
+---
+
+#### 账面价值显示的一致性（统一结论）
+
+**计算层：** 无论哪条路径，一旦资产被查询出来，`getDepreciatedValue()` 的计算逻辑完全相同（无 deleted_at/status_id/archived 判断）。
+
+**Transformer 层（仅 API 路径）：** 在计算前额外检查 `$asset->model->depreciation->months !== 0`，若不满足则：
+- `book_value` 和 `diff` 为 null（或空值）
+- 若型号有 EOL 字段，`monthly_depreciation` 回退为 `purchase_cost / eol`
+
+**CSV 导出层：** 无 Transformer 层检查，直接调用 `getDepreciatedValue()`，无折旧配置时返回 `purchase_cost`。
 
 **各路径的账面价值显示差异仅在于：**
 1. **哪些资产被包含在结果集中**（由查询过滤决定）
-2. **账面价值的汇总（sumFormatter）会因为包含/排除归档/已删除资产而不同**
-3. **计算逻辑本身没有任何差异**
+2. **无折旧配置资产的处理方式**（API 路径：不显示账面价值；CSV 路径：显示为 purchase_cost）
+3. **账面价值的汇总（sumFormatter）会因为包含/排除归档/已删除资产而不同**
+4. **计算逻辑本身没有任何差异**
 
 #### 前端表格列配置
 
@@ -740,3 +775,19 @@ GET /api/hardware?status_type=Archived
 
 ### 3. 折旧报告的数据隔离
 折旧报告通过路由名识别上下文，自动切换 Transformer 并过滤无折旧配置的资产，保证了报告数据的相关性，同时复用了同一套查询基础设施。
+
+### 4. 四路径筛选的设计权衡
+折旧报告的四路径筛选（默认/显式归档/开关/已删除）体现了清晰的权责分离：
+- **默认路径**：面向日常运营，排除归档和已删除，聚焦在用资产
+- **显式归档路径**：面向档案管理，专门查看已退出使用的资产
+- **开关控制**：面向系统配置，灵活适配不同组织的归档策略
+- **已删除路径**：面向审计和资产处置，追踪已报废资产的剩余价值
+
+这种设计避免了单一视图无法满足多角色需求的问题，同时保持了代码的复用性——所有路径共享同一个 `index()` 方法和同一套折旧计算逻辑。
+
+### 5. 汇总值差异的设计意图
+账面价值汇总值在不同路径下的显著差异（最大可达 69%）并非设计缺陷，而是有意为之：
+- 运营视角：只关心在用资产的账面价值
+- 财务视角：需要包含归档资产的完整账面价值
+- 审计视角：需要单独追踪已报废资产的账面价值
+- 不同汇总值服务于不同决策场景，通过路径切换实现数据的多维度呈现
