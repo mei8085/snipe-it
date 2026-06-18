@@ -5,18 +5,127 @@
 折旧与报废的处理链路涉及以下核心模块，层层递进：
 
 ```
-折旧配置入口 → 折旧规则模型 → 计算Trait层 → 资产模型继承 → 报废软删除 → 账面价值展示
-   │              │              │            │              │           │
-   ▼              ▼              ▼            ▼              ▼           ▼
- Settings    Depreciation    Depreciable     Asset     SoftDeletes     Presenter
-Controller     Model          Trait         Model      (Eloquent)    /Transformer
+折旧配置入口 → 折旧规则模型 → 计算Trait层 → 资产模型继承 → 状态标签体系 → 报废软删除 → API查询分流 → 账面价值展示
+   │              │              │            │              │              │            │             │
+   ▼              ▼              ▼            ▼              ▼              ▼            ▼             ▼
+ Settings    Depreciation    Depreciable     Asset        Statuslabel   SoftDeletes   Api/Assets   Presenter
+Controller     Model          Trait         Model          Model      (Eloquent)    Controller   /Transformer
 ```
 
 ---
 
-## 二、折旧曲线参数体系
+## 二、状态标签体系（Statuslabel）
 
-### 2.1 折旧规则定义（Depreciation 模型）
+状态标签是资产生命周期的业务层核心标识，与报废（软删除）共同构成双层过滤机制。
+
+### 2.1 状态标签的四象限分类
+
+[Statuslabel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Statuslabel.php) L99-L110 定义了 `getStatuslabelType()` 方法，通过三个布尔字段的组合，将所有状态标签划分为**互斥的四类**：
+
+| 状态类型 | `deployable` | `pending` | `archived` | 说明 |
+|---------|-------------|-----------|------------|------|
+| `pending` | 0 | 1 | 0 | 待处理：资产尚未就绪，等待审批/验收 |
+| `archived` | 0 | 0 | 1 | 归档：资产已退出日常使用但保留记录 |
+| `undeployable` | 0 | 0 | 0 | 不可部署：资产损坏、维修中、丢失等 |
+| `deployable` | 1 | 0 | 0 | 可部署：资产正常可用（默认情况） |
+
+**核心字段验证规则**（L32-L38）：
+```php
+protected $rules = [
+    'name'       => 'required|max:255|string|unique_undeleted',
+    'deployable' => 'required',
+    'pending'    => 'required',
+    'archived'   => 'required',
+];
+```
+
+这三个字段**必须同时设置**且组合唯一，确保系统中不会出现模糊的状态定义。
+
+### 2.2 状态标签对资产操作的影响
+
+#### 自动签回触发（资产更新时）
+
+当资产状态变更为 `archived` 或 `undeployable` 时，如果资产正被借出，系统会**强制自动签回**。
+
+[AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Assets/AssetsController.php) L435-L441：
+
+```php
+$status = Statuslabel::find($request->input('status_id'));
+
+// 状态变为 archived 或 undeployable 且资产已借出 → 自动签回
+if (($status) 
+    && (($status->getStatuslabelType() != 'pending') 
+        && ($status->getStatuslabelType() != 'deployable'))  // 排除 pending 和 deployable
+    && ($target = $asset->assignedTo)) {
+    
+    $originalValues = $asset->getRawOriginal();
+    $asset->assigned_to = null;
+    $asset->assigned_type = null;
+    $asset->accepted = null;
+    $asset->last_checkin = now();
+    
+    event(new CheckoutableCheckedIn(
+        $asset, $target, auth()->user(), 
+        'Checkin on asset update with '.$status->getStatuslabelType().' status',
+        date('Y-m-d H:i:s'), $originalValues
+    ));
+}
+```
+
+**关键理解：** `pending` 和 `deployable` 状态不触发自动签回。这意味着待处理资产和可部署资产允许被持续借出，只有归档和不可部署状态会强制收回。
+
+#### 签出/签入权限控制
+
+[Asset.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Asset.php) L468-L502：
+
+```php
+// 可签出条件：未分配 + 未删除 + 状态非归档 + 状态可部署
+public function availableForCheckout()
+{
+    if ((! $this->assigned_to) && (! $this->deleted_at)) {
+        if (($this->status) && ($this->status->archived == '0')
+            && ($this->status->deployable == '1')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 可签入条件：已分配 或 已删除（特殊情况）
+public function availableForCheckIn()
+{
+    if ($this->assigned_to == '') { return false; }
+    if ($this->deleted_at != '') { return true; }  // 已删除资产始终允许签回
+    
+    return $this->status
+        && ($this->status->archived == '0')
+        && ($this->status->deployable == '1');
+}
+```
+
+### 2.3 状态标签 vs 软删除（deleted_at）
+
+这是两套**独立但互补**的机制：
+
+| 维度 | `status_id` + `archived` | `deleted_at`（SoftDeletes） |
+|------|-------------------------|-----------------------------|
+| 层面 | 业务状态 | 数据存在状态 |
+| 管理 | 自定义状态标签，用户可增删 | Laravel 内置机制，透明管理 |
+| 查询排除 | 需要手动 JOIN 过滤 | 全局 Scope 自动排除 |
+| 恢复方式 | 改回其他状态标签 | `restore()` 方法 |
+| 对折旧影响 | 仅影响查询范围，不影响计算逻辑 | 仅影响查询范围，不影响计算逻辑 |
+| 可同时存在 | ✅ 是的，可以同时设置 | ✅ 是的，可以同时设置 |
+
+**双重过滤的典型场景**（`availableForCheckout()`）：
+```
+可签出 = (deleted_at 为空) AND (status.archived = 0) AND (status.deployable = 1)
+```
+
+---
+
+## 三、折旧曲线参数体系
+
+### 3.1 折旧规则定义（Depreciation 模型）
 
 折旧规则定义在 [Depreciation.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciation.php)，这是整个折旧体系的参数源头。
 
@@ -29,13 +138,9 @@ Controller     Model          Trait         Model      (Eloquent)    /Transforme
 | `depreciation_type` | enum | 残值类型：`amount`（固定金额）/ `percent`（百分比） | 必填，二选一 |
 | `depreciation_min` | numeric | 残值值。当 type=percent 时取值范围 0-100 | 必填，数值型 |
 
-**关系链：**
-- `Depreciation` → `hasMany(AssetModel::class)`：折旧规则被多个资产型号引用
-- `Depreciation` → `hasManyThrough(Asset::class, AssetModel::class)`：通过型号间接关联实际资产
-
 **创建与管理入口：** [DepreciationsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/DepreciationsController.php) 的 `store()` / `update()` 方法（L58-L91, L123-L152）。
 
-### 2.2 全局折旧方法选择（Setting）
+### 3.2 全局折旧方法选择（Setting）
 
 系统级折旧计算策略由 `Settings` 表的 `depreciation_method` 字段控制，在 [SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) L129 处写入。
 
@@ -47,23 +152,15 @@ Controller     Model          Trait         Model      (Eloquent)    /Transforme
 | `half_1` | 半年惯例（强制半年首年）：首年统一只计半年折旧 | `getHalfYearDepreciatedValue(true)` |
 | `half_2` | 半年惯例（按购入时点）：年中购入才只计半年 | `getHalfYearDepreciatedValue(false)` |
 
-方法调度入口在 [Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) L52-L63 的 `getDepreciatedValue()`：
-
-```php
-switch ($setting->depreciation_method) {
-    case 'half_1':  $depreciation = $this->getHalfYearDepreciatedValue(true);  break;
-    case 'half_2':  $depreciation = $this->getHalfYearDepreciatedValue(false); break;
-    default:        $depreciation = $this->getLinearDepreciatedValue();        break;
-}
-```
+方法调度入口在 [Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) L52-L63 的 `getDepreciatedValue()`。
 
 ---
 
-## 三、折旧计算详解（Depreciable Trait）
+## 四、折旧计算详解（Depreciable Trait）
 
-### 3.1 残值计算（calculateDepreciation）
+### 4.1 残值计算（calculateDepreciation）
 
-在 [Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) L231-L243：
+[Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) L231-L243：
 
 ```php
 private function calculateDepreciation()
@@ -76,60 +173,31 @@ private function calculateDepreciation()
 }
 ```
 
-### 3.2 直线法（getLinearDepreciatedValue）
-
-L71-L95，核心公式：
+### 4.2 直线法（getLinearDepreciatedValue）
 
 **情形 A：已超过折旧年限**
-- 若配置了残值（`depreciation_min` 非空）→ 账面价值 = 残值（通过 `calculateDepreciation()` 计算）
+- 若配置了残值 → 账面价值 = 残值
 - 若无残值配置 → 账面价值 = 0
 
 **情形 B：仍在折旧年限内**
-
 ```
 账面价值 = 购入成本 − (购入成本 − 残值) × (已过月数 / 总折旧月数)
 ```
 
-对应代码 L90：
-```php
-$current_value = round(
-    ($this->purchase_cost - ($this->purchase_cost - $this->calculateDepreciation())) 
-    * ($months_passed / $this->get_depreciation()->months),
-    2
-);
-```
-
-注意：此处公式展开后等价于 `purchase_cost - (cost - floor) * (elapsed/total)`，符合标准直线折旧法。
-
-**每月折旧额** 在 L97-L102：
+**每月折旧额：**
 ```php
 getMonthlyDepreciation() = (purchase_cost - calculateDepreciation()) / months
 ```
 
-### 3.3 半年惯例法（getHalfYearDepreciatedValue）
+### 4.3 半年惯例法（getHalfYearDepreciatedValue）
 
-L108-L133，适用于税务折旧场景（如美国 MACRS 半年惯例）。
+适用于税务折旧场景（如美国 MACRS 半年惯例），核心是**按财年**而非自然月计算：
+1. 财年规则：12-31 视为当年，其他日期视为上一年
+2. 首年调整：`half_1` 强制半年，`half_2` 仅年中购入才算半年
+3. 当年调整：当前日期在下半年时加 0.5 年
+4. 年限被夹在 `[0, 折旧年限]` 之间
 
-**核心逻辑：**
-1. 将折旧月数转换为年度：`ceil(months / 12)`
-2. 以财年（fiscal year）为计算单位：`12-31` 视为当年，其他日期视为上一年（见 L139-L148 `get_fiscal_year()`）
-3. 首年调整：
-   - `half_1`（强制）：首年永远只算 0.5 年
-   - `half_2`（时点）：仅当年中购入（6月1日之后，L154-L159 `is_first_half_of_year()`）才只算 0.5 年
-4. 当年调整：当前日期在下半年时，再加 0.5 年
-5. 最终年限被夹在 `[0, 折旧年限]` 之间
-
-**账面价值公式：**
-```
-账面价值 = 购入成本 − round(已过年数 / 折旧年限 × 购入成本, 2)
-```
-
-### 3.4 折旧完成日期与进度
-
-- **`depreciated_date()`**（L180-L190）：`purchase_date + months`
-- **`depreciationProgressPercent()`**（L196-L206）：已过月数 / 总月数 × 100%，限制在 0-100%
-
-### 3.5 资产模型如何获取折旧配置
+### 4.4 资产如何获取折旧配置
 
 [Asset.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Asset.php) L695-L700 的 `get_depreciation()` 方法：
 
@@ -142,15 +210,149 @@ public function get_depreciation()
 }
 ```
 
-**关键理解：资产自身不持有折旧ID，而是通过 AssetModel 间接获取折旧规则。** 这意味着同一型号的所有资产共享同一条折旧曲线参数。关系定义在 L664-L667（`hasOneThrough`）。
+**关键理解：资产自身不持有折旧ID，而是通过 AssetModel 间接获取折旧规则。** 同一型号的所有资产共享同一条折旧曲线参数。
 
 ---
 
-## 四、报废（删除/恢复）处理流程
+## 五、API 查询分流与列表过滤
 
-Snipe-IT 中资产"报废"对应 Eloquent 的 **SoftDeletes** 软删除机制，而非物理删除。
+资产列表的查询分流逻辑集中在 [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) 的 `index()` 方法（L65-L305），这是整个系统最核心的查询入口。
 
-### 4.1 报废触发（destroy 方法）
+### 5.1 状态类型查询分流（status_type）
+
+L227-L300 通过 `status_type`（或兼容旧版的 `status`）参数，将查询导向不同分支：
+
+```php
+$status_type_key = $request->filled('status_type') 
+    ? $request->input('status_type') 
+    : $request->input('status');
+
+switch ($status_type_key) {
+    case 'Deleted':
+        $assets->onlyTrashed();   // 仅已删除（软删）资产
+        break;
+    case 'Pending':
+        $assets->join('status_labels AS status_alias', function ($join) {
+            $join->on('status_alias.id', '=', 'assets.status_id')
+                ->where('status_alias.deployable', '=', 0)
+                ->where('status_alias.pending', '=', 1)
+                ->where('status_alias.archived', '=', 0);
+        });
+        break;
+    case 'RTD':  // Ready To Deploy
+        $assets->whereNull('assets.assigned_to')
+            ->join('status_labels AS status_alias', function ($join) {
+                $join->on('status_alias.id', '=', 'assets.status_id')
+                    ->where('status_alias.deployable', '=', 1)
+                    ->where('status_alias.pending', '=', 0)
+                    ->where('status_alias.archived', '=', 0);
+            });
+        break;
+    case 'Undeployable':
+        $assets->Undeployable();   // 调用模型 scope
+        break;
+    case 'Archived':
+        $assets->join('status_labels AS status_alias', function ($join) {
+            $join->on('status_alias.id', '=', 'assets.status_id')
+                ->where('status_alias.deployable', '=', 0)
+                ->where('status_alias.pending', '=', 0)
+                ->where('status_alias.archived', '=', 1);
+        });
+        break;
+    case 'Deployed':
+        $assets->whereNotNull('assets.assigned_to');  // 只要已分配就算 Deployed
+        break;
+    default:
+        // 默认情况：根据 show_archived_in_list 设置决定是否排除归档
+        if ((! $request->filled('status_id')) && ($settings->show_archived_in_list != '1')) {
+            $assets->join('status_labels AS status_alias', function ($join) {
+                $join->on('status_alias.id', '=', 'assets.status_id')
+                    ->where('status_alias.archived', '=', 0);  // 排除归档
+            });
+        } else {
+            $assets->join('status_labels AS status_alias', function ($join) {
+                $join->on('status_alias.id', '=', 'assets.status_id');  // 纯 JOIN，不过滤
+            });
+        }
+}
+```
+
+### 5.2 查询分流全景图
+
+| status_type 值 | 查询条件 | 包含 deleted_at != '' 的资产？ |
+|---------------|---------|-------------------------------|
+| `Deleted` | `onlyTrashed()` | ✅ **仅包含**（已软删的） |
+| `Pending` | status.pending = 1 | ❌ 不包含（SoftDeletes 全局排除） |
+| `RTD` | status.deployable = 1 AND assigned_to IS NULL | ❌ 不包含 |
+| `Undeployable` | 调用 scopeUndeployable() | ❌ 不包含 |
+| `Archived` | status.archived = 1 | ❌ 不包含 |
+| `Deployed` | assigned_to IS NOT NULL | ❌ 不包含 |
+| 默认（无参数） | 根据 `show_archived_in_list` 决定是否排除 archived=1 | ❌ 不包含 |
+
+### 5.3 归档显示开关（show_archived_in_list）
+
+[SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) L115：
+
+```php
+$setting->show_archived_in_list = $request->input('show_archived_in_list', '0');
+```
+
+**行为：**
+- `show_archived_in_list = 0`（默认）：默认列表不显示归档资产（status.archived = 1）
+- `show_archived_in_list = 1`：默认列表显示归档资产
+- 仅当**未指定** `status_id` 时生效（L287），如果明确指定了状态 ID 则不过滤
+
+### 5.4 模型层查询范围（Scopes）
+
+[Asset.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Asset.php) 中定义了一系列 scope：
+
+| Scope 方法 | 位置 | 作用 |
+|-----------|------|------|
+| `scopePending()` | L1483-L1488 | 状态为 pending 的资产 |
+| `scopeRTD()` | L1536-L1542 | 就绪待部署资产 |
+| `scopeUndeployable()` | L1551-L1556 | 不可部署资产 |
+| `scopeNotArchived()` | L1565-L1570 | 非归档资产 |
+| `scopeArchived()` | L1751-L1756 | 已归档资产 |
+| `scopeDeployed()` | L1765-L1767 | 已分配资产 |
+| `scopeAssetsForShow()` | L1731-L1742 | 受 `show_archived_in_list` 控制的显示范围 |
+| `scopeByDepreciationId()` | L2153-L2157 | 按折旧规则 ID 过滤 |
+
+**这些 scopes 同样受 SoftDeletes 全局 Scope 影响**，除非显式调用 `withTrashed()`，否则自动排除已软删资产。
+
+### 5.5 折旧报告的专用查询路径
+
+当路由为 `api.depreciation-report.index` 时，查询路径发生特殊分支（L85-L88, L173-L176）：
+
+```php
+if (Route::currentRouteName() == 'api.depreciation-report.index') {
+    $filter_non_deprecable_assets = true;
+    $transformer = 'App\Http\Transformers\DepreciationReportTransformer';
+    $this->authorize('reports.view');
+}
+```
+
+后续 L173-L176 自动过滤没有折旧配置的资产型号：
+```php
+if ($filter_non_deprecable_assets) {
+    $non_deprecable_models = AssetModel::select('id')->whereNotNull('depreciation_id')->get();
+    $assets->InModelList($non_deprecable_models->toArray());
+}
+```
+
+**这意味着折旧报告中**不会**出现未配置折旧规则的资产。**
+
+同时支持按折旧规则过滤（L362-L363）：
+```php
+if ($request->filled('depreciation_id')) {
+    $assets->ByDepreciationId($request->input('depreciation_id'));
+}
+```
+
+---
+
+## 六、报废（删除/恢复）处理流程
+
+### 6.1 报废触发（destroy 方法）
 
 入口在 [AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Assets/AssetsController.php) L536-L561：
 
@@ -161,10 +363,10 @@ public function destroy(Request $request, Asset $asset): RedirectResponse
     
     // 步骤1：若资产正被借出 → 自动签回
     if ($asset->assignedTo) {
-        event(new CheckoutableCheckedIn(...)); // 触发签入事件
+        event(new CheckoutableCheckedIn(...));
         DB::table('assets')
             ->where('id', $asset->id)
-            ->update(['assigned_to' => null, 'assigned_type' => null]); // 清空分配字段
+            ->update(['assigned_to' => null, 'assigned_type' => null]);
     }
     
     // 步骤2：删除资产图片文件
@@ -177,18 +379,14 @@ public function destroy(Request $request, Asset $asset): RedirectResponse
 }
 ```
 
-**前置条件：**
-- `Gate::allows('delete', $asset)` 权限检查
-- `isDeletable()`（Asset.php L435-L440）：要求 `deleted_at == ''`（未被删除过）
-
-**模型事件：** Asset.php L235-L244 注册了软删除监听
+**模型事件：** [Asset.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Asset.php) L235-L244 注册了软删除监听：
 ```php
 static::softDeleted(function (Asset $asset) {
     $asset->requests()->delete();  // 连带删除该资产的领用请求
 });
 ```
 
-### 4.2 报废资产的恢复（restore）
+### 6.2 报废资产的恢复（restore）
 
 L942-L966 的 `getRestore()` 方法：
 
@@ -199,178 +397,192 @@ public function getRestore($assetId = null)
     if ($asset = Asset::withTrashed()->find($assetId)) {
         $this->authorize('delete', $asset);
         
-        // 防止重复恢复
-        if ($asset->deleted_at == '') { return redirect()->back()->withError(...); }
+        if ($asset->deleted_at == '') { /* 防止重复恢复 */ }
         
         // 恢复（清空 deleted_at），若资产标签冲突会触发 UniqueUndeletedTrait 校验失败
         if ($asset->restore()) { ... }
-        
-        return redirect()->back()->withError(...);
     }
 }
 ```
 
-### 4.3 已报废资产的查询范围
-
-Asset 模型中通过 `scopeArchived()`（L1751-L1757）、`scopeNotArchived()`（L1565-L1571）等方法配合 `status_id` 过滤资产。关键是 Laravel SoftDeletes 自动注入的全局 scope：
-- 常规查询（`Asset::where(...)`）自动排除 `deleted_at IS NOT NULL` 的记录
-- 需使用 `Asset::withTrashed()` 才能看到已报废资产
-- `Asset::onlyTrashed()` 仅查看已报废资产
-
-**报废 vs 状态标签（Statuslabel）的区别：**
-- `deleted_at`：物理层面的"报废/已删除"，由 Laravel SoftDeletes 管理
-- `status_id` 配合 `archived` 字段：业务层面的"归档"状态标签
-- 两者互不冲突，但查询范围往往同时检查二者（如 `availableForCheckout()` L472 检查了 `deleted_at` + `status->archived` + `status->deployable`）
-
 ---
 
-## 五、账面价值（Book Value）展示链路
+## 七、报废/归档对账面价值展示的影响链路
 
-从计算到前端展示，账面价值的传播路径如下：
+### 7.1 核心原则：计算与展示分离
 
-### 5.1 计算层
+**账面价值的计算逻辑完全不关心资产状态。**
 
-`Asset` → 继承 `Depreciable` → 调用 `getDepreciatedValue()` → 根据全局折旧方法分派。
+[Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) L41-L66 的 `getDepreciatedValue()` 方法中：
+- ❌ 没有任何 `deleted_at` 判断
+- ❌ 没有任何 `status_id` 判断
+- ❌ 没有任何 `archived` 判断
+- ✅ 只依赖 `purchase_date`、`purchase_cost`、`get_depreciation()` 返回的折旧规则
 
-这是**实时动态计算**，不是数据库存值。每次访问都会根据当前时间重新计算。
+### 7.2 状态影响展示的唯一途径：查询过滤
 
-### 5.2 数据转换层（Transformer）
+状态标签和 `deleted_at` **唯一影响账面价值展示的方式是决定哪些资产会被查询出来**，进入 Transformer 层。
 
-#### 资产列表 API：[AssetsTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/AssetsTransformer.php) L127
-
-```php
-'book_value' => Helper::formatCurrencyOutput($asset->getDepreciatedValue()),
+**完整链路：**
+```
+前端请求（带 status_type 参数）
+    ↓
+Api/AssetsController::index()  → 应用查询过滤（JOIN status_labels + withTrashed/onlyTrashed）
+    ↓
+查询结果集合（只包含符合过滤条件的资产）
+    ↓
+AssetsTransformer::transformAsset()  → 对每个资产调用 $asset->getDepreciatedValue()
+    ↓
+JSON 响应中的 book_value 字段
 ```
 
-同时在 L71-L77 会附带返回折旧规则的元信息：
-```php
-'depreciation' => [
-    'id'       => (int) $asset->model->depreciation->id,
-    'name'     => e($asset->model->depreciation->name),
-    'months'   => (int) $asset->model->depreciation->months,
-    'type'     => e($asset->model->depreciation->depreciation_type),
-    'minimum'  => ($asset->model->depreciation->depreciation_min) 
-                  ? (int) $asset->model->depreciation->depreciation_min : null,
-],
+### 7.3 各状态下的账面价值可见性
+
+| 资产状态 | 常规列表（无参数） | ?status_type=Deleted | ?status_type=Archived | 折旧报告 |
+|---------|-------------------|---------------------|------------------------|---------|
+| 正常，deployable | ✅ 可见 | ❌ 不可见 | ❌ 不可见 | ✅ 可见（有折旧配置） |
+| 正常，archived | ✅/❌ 取决于 show_archived_in_list | ❌ 不可见 | ✅ 可见 | ✅ 可见（有折旧配置） |
+| 正常，undeployable | ✅ 可见 | ❌ 不可见 | ❌ 不可见 | ✅ 可见（有折旧配置） |
+| 已软删（deleted_at != ''） | ❌ 不可见 | ✅ 可见 | ❌ 不可见 | ❌ 不可见（无 withTrashed） |
+| 已软删 + archived | ❌ 不可见 | ✅ 可见 | ❌ 不可见 | ❌ 不可见 |
+
+### 7.4 特殊场景说明
+
+#### 场景 A：已软删资产的账面价值
+```
+GET /api/hardware?status_type=Deleted
+    → onlyTrashed() → 查询出已软删资产
+    → 每个资产依然正常调用 getDepreciatedValue()
+    → 折旧继续按时间推进，不因为 deleted_at 而停止
+    → 响应中包含正常计算的 book_value
 ```
 
-#### 折旧报告 API：[DepreciationReportTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/DepreciationReportTransformer.php) L66-L72, L103
-
-```php
-if (($asset->model) && ($asset->model->depreciation) && ($asset->model->depreciation->months !== 0)) {
-    $depreciated_value      = Helper::formatCurrencyOutput($asset->getDepreciatedValue());
-    $monthly_depreciation   = Helper::formatCurrencyOutput($asset->getMonthlyDepreciation());
-    $diff                   = Helper::formatCurrencyOutput(($asset->purchase_cost - $asset->getDepreciatedValue()));
-}
+#### 场景 B：归档资产的账面价值
+```
+GET /api/hardware?status_type=Archived
+    → JOIN status_labels where archived = 1
+    → 资产账面价值正常计算
+    → 状态变更为归档不影响折旧计算，只影响是否显示
 ```
 
-折旧报告额外提供了：
-- **monthly_depreciation**：每月折旧额
-- **diff**：累计折旧（购入成本 - 当前账面价值）
-- **number_of_months**：折旧总月数
-- **depreciation**：折旧规则名称
-
-### 5.3 前端表格列定义（Presenter）
-
-#### 资产列表：[AssetPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Presenters/AssetPresenter.php) L181-L186
-
-```php
-[
-    'field'           => 'book_value',
-    'searchable'      => false,
-    'sortable'        => false,
-    'title'           => trans('admin/hardware/table.book_value'),
-    'footerFormatter' => 'sumFormatter',   // 表格底部自动求和
-    'class'           => 'text-right',
-],
+#### 场景 C：资产状态变更为 archived 时的连锁反应
+```
+1. 更新资产 status_id 为 archived 状态
+2. AssetsController::update() 检测到状态变更
+3. 若资产已借出 → 自动签回（assigned_to 清空）
+4. 资产保存成功
+5. 下次查询时，除非 show_archived_in_list = 1 或指定 ?status_type=Archived，否则不显示
+6. 但只要能查询到，账面价值依然按原规则计算
 ```
 
-注意：账面价值列**不可搜索、不可排序**，因为它是运行时计算属性，不是数据库字段。
+#### 场景 D：折旧报告中的已删除资产
+折旧报告查询路径**没有**调用 `withTrashed()`，因此**已软删资产不会出现在折旧报告中**。
 
-#### 折旧报告：[DepreciationReportPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Presenters/DepreciationReportPresenter.php) L142-L146 同样定义了 book_value 列。
+但**已归档资产会正常出现在折旧报告中**（只要有折旧配置），因为归档只是业务状态，不是数据删除。
 
-### 5.4 报废对账面价值展示的影响
-
-**关键点：账面价值计算不区分资产是否已报废。**
-
-`getDepreciatedValue()` 的代码（Depreciable.php L41-L66）中没有任何 `deleted_at` 判断。这意味着：
-
-1. **报废后的资产仍然可以计算账面价值** — 只要你能通过 `withTrashed()` 或 `onlyTrashed()` 查询到它
-2. **报废本身不改变折旧逻辑** — 折旧继续按时间推进，不会因为资产被标记删除而停止
-3. **在常规资产列表中看不到报废资产的账面价值** — 因为 SoftDeletes 全局 scope 已将其排除，但在"已删除资产"视图中（使用 `withTrashed`）仍可正常计算和展示
-4. **恢复资产后，账面价值自然延续** — 因为是实时计算，恢复后直接用当前时间重新算即可，无需补录
-
-### 5.5 无折旧配置的资产
+### 7.5 无折旧配置的资产
 
 当资产型号未关联折旧规则时：
 - `get_depreciation()` 返回 `null`
 - `getDepreciatedValue()` 直接返回 `purchase_cost`（L43-L45）
 - 即：无折旧配置的资产，账面价值永远等于购入成本
+- **折旧报告自动排除这类资产**（通过 L173-L176 过滤）
 
 ---
 
-## 六、典型场景数据流
+## 八、典型场景数据流
 
-### 场景1：新增资产型号并配置折旧
-
-```
-1. 管理员创建折旧规则（/depreciations）
-   → DepreciationsController::store()
-   → 写入 depreciations 表（name, months, type, min）
-
-2. 管理员创建资产型号，选择上述折旧规则
-   → 写入 models 表的 depreciation_id 字段
-
-3. 资产入库时选择该型号
-   → 写入 assets 表的 model_id、purchase_cost、purchase_date
-   → 资产通过 model→depreciation 隐式关联折旧规则
-```
-
-### 场景2：浏览资产列表查看账面价值
+### 场景1：资产报废 → 在已删除列表查看账面价值 → 恢复
 
 ```
-1. GET /hardware → 页面加载
-2. 前端 AJAX 请求 /api/hardware（Datatables）
-3. AssetsTransformer::transformAsset()
-   → $asset->getDepreciatedValue() 计算
-   → Helper::formatCurrencyOutput() 格式化货币
-   → book_value 字段输出
-4. Bootstrap Table 通过 AssetPresenter 定义的列配置渲染
-5. 底部通过 sumFormatter 汇总全部账面价值
-```
-
-### 场景3：资产报废 → 恢复
-
-```
-1. 点击"删除" → AssetsController::destroy()
-   → 若已借出则触发签入事件
+1. 资产正常使用中，账面价值按月递减
+2. 点击"删除" → AssetsController::destroy()
+   → 若已借出则自动签回
    → SoftDeletes 设置 deleted_at
    → 资产从默认列表中消失
-
-2. "已删除资产"页面（/hardware?status=deleted）
-   → 使用 withTrashed 查询
-   → 账面价值依然按 getDepreciatedValue() 正常计算
-
-3. 点击"恢复" → AssetsController::getRestore()
+3. 导航到"已删除资产" → GET /api/hardware?status_type=Deleted
+   → Api/AssetsController 调用 onlyTrashed()
+   → 查询出所有已软删资产
+   → 每个资产正常调用 getDepreciatedValue()
+   → 账面价值继续按时间递减（未因为报废而冻结）
+4. 点击"恢复" → AssetsController::getRestore()
    → restore() 清空 deleted_at
    → 资产重新出现在常规列表
-   → 账面价值无任何"中断续接"问题，因为始终是实时计算
+   → 账面价值无缝衔接，无任何"中断续接"问题
+```
+
+### 场景2：资产状态变更为归档
+
+```
+1. 资产状态更新为"已报废"（标签类型为 archived）
+   → AssetsController::update() 检测到状态变更为非 deployable
+   → 若已借出则自动签回
+2. 默认列表中（show_archived_in_list = 0）
+   → 查询自动加上 status_alias.archived = 0 条件
+   → 该资产不再显示
+3. 切换到"已归档"视图 → GET /api/hardware?status_type=Archived
+   → JOIN status_labels where archived = 1
+   → 资产正常显示，账面价值正常计算
+4. 折旧报告中该资产依然存在（有折旧配置的话）
+   → 账面价值继续按月计算
+   → 归档是业务状态，不影响折旧曲线
+```
+
+### 场景3：折旧报告查看特定折旧规则的资产
+
+```
+1. GET /api/reports/depreciation?depreciation_id=5
+   → 路由命中 api.depreciation-report.index
+   → filter_non_deprecable_assets = true
+   → 过滤掉无 depreciation_id 的资产型号
+   → 按 depreciation_id = 5 过滤
+   → 使用 DepreciationReportTransformer
+2. Transformer 输出更详细的折旧信息：
+   - book_value（当前账面价值）
+   - monthly_depreciation（每月折旧额）
+   - diff（累计折旧 = purchase_cost - book_value）
+   - number_of_months（折旧总月数）
+3. 已软删资产不出现在报告中（无 withTrashed）
+4. 已归档资产正常出现在报告中
 ```
 
 ---
 
-## 七、关键代码速查表
+## 九、关键代码速查表
 
 | 功能 | 文件 | 方法/位置 |
 |------|------|-----------|
+| 状态标签四象限分类 | [Statuslabel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Statuslabel.php) | `getStatuslabelType()` L99 |
+| 资产更新时自动签回 | [AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Assets/AssetsController.php) | L435-L441 |
+| 可签出检查 | [Asset.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Asset.php) | `availableForCheckout()` L468 |
+| API 查询分流 | [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `index()` L227-L300 |
+| 折旧报告专用路径 | [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) | L85-L88, L173-L176 |
 | 折旧规则模型 | [Depreciation.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciation.php) | 全文 |
-| 折旧计算核心 | [Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) | `getDepreciatedValue()` L41, `getLinearDepreciatedValue()` L71, `getHalfYearDepreciatedValue()` L108 |
-| 残值计算 | [Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) | `calculateDepreciation()` L231 |
-| 资产获取折旧 | [Asset.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Asset.php) | `get_depreciation()` L695 |
+| 折旧计算核心 | [Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) | `getDepreciatedValue()` L41 |
 | 报废（软删） | [AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Assets/AssetsController.php) | `destroy()` L536 |
 | 恢复资产 | [AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Assets/AssetsController.php) | `getRestore()` L942 |
 | 软删模型事件 | [Asset.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Asset.php) | `booted()` L235-L244 |
-| 账面价值输出 | [AssetsTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/AssetsTransformer.php) | L127 |
-| 折旧报告输出 | [DepreciationReportTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/DepreciationReportTransformer.php) | `transformAsset()` L33 |
+| 资产列表账面价值输出 | [AssetsTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/AssetsTransformer.php) | L127 |
+| 折旧报告账面价值输出 | [DepreciationReportTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/DepreciationReportTransformer.php) | `transformAsset()` L33 |
 | 表格列配置 | [AssetPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Presenters/AssetPresenter.php) | book_value L181 |
+| 归档显示开关 | [SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) | L115 |
 | 折旧方法全局设置 | [SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) | L129 |
+
+---
+
+## 十、核心设计洞察
+
+### 1. 计算与查询的关注点分离
+账面价值计算（Depreciable Trait）与资产状态（Statuslabel + SoftDeletes）完全解耦。计算层只关心时间和折旧规则，查询层负责根据状态过滤。这种设计使得：
+- 折旧算法可以独立演进
+- 新状态类型的添加不影响折旧逻辑
+- 已删除/归档资产的历史账面价值可追溯
+
+### 2. 双层过滤机制的设计意图
+- `deleted_at` 处理"数据存在性"：资产是否还在系统中"活着"
+- `status_id` + `archived` 处理"业务可用性"：资产是否还在正常使用
+
+两者结合提供了比单一状态字段更丰富的生命周期表达能力。
+
+### 3. 折旧报告的数据隔离
+折旧报告通过路由名识别上下文，自动切换 Transformer 并过滤无折旧配置的资产，保证了报告数据的相关性，同时复用了同一套查询基础设施。
