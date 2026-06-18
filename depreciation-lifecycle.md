@@ -348,6 +348,160 @@ if ($request->filled('depreciation_id')) {
 }
 ```
 
+### 5.6 折旧报告归档筛选四路径对比
+
+折旧报告的前端入口在 [depreciation.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/resources/views/reports/depreciation.blade.php)，默认数据 URL 为：
+```
+data-url="{{ route('api.depreciation-report.index') }}"
+```
+
+路由定义在 [api.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/routes/api.php) L359-L364：
+```php
+Route::get('reports/depreciation',
+    [Api\AssetsController::class, 'index']
+)->name('api.depreciation-report.index');
+```
+
+**关键洞察：折旧报告复用了 Api/AssetsController 的同一个 `index()` 方法，通过路由名识别上下文切换行为。**
+
+#### 路径一：默认报告（无 status_type 参数）
+
+对应前端页面直接访问 `GET /reports/depreciation`。
+
+[Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) 执行流程：
+1. L85 路由名匹配 → `$filter_non_deprecable_assets = true`
+2. L173-L176 过滤无折旧配置的资产型号
+3. L227-L232 未传入 `status_type` → `$status_type_key = null`
+4. L234 switch 进入 `default` 分支
+5. L287-L299 根据 `show_archived_in_list` 决定归档资产是否显示：
+
+```php
+default:
+    if ((! $request->filled('status_id')) && ($settings->show_archived_in_list != '1')) {
+        $assets->join('status_labels AS status_alias', function ($join) {
+            $join->on('status_alias.id', '=', 'assets.status_id')
+                ->where('status_alias.archived', '=', 0);  // 排除归档
+        });
+    } else {
+        $assets->join('status_labels AS status_alias', function ($join) {
+            $join->on('status_alias.id', '=', 'assets.status_id');  // 纯 JOIN，不过滤
+        });
+    }
+```
+
+**默认报告的归档行为：**
+- `show_archived_in_list = 0`（默认值，[SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) L115）→ **不显示归档资产**
+- `show_archived_in_list = 1` → **显示归档资产**
+- 无论开关如何，**不显示已软删资产**（无 `withTrashed()` 调用）
+- **不显示无折旧配置的资产**（被 L173-L176 过滤）
+
+#### 路径二：显式归档筛选（?status_type=Archived）
+
+对应 API 调用 `GET /api/reports/depreciation?status_type=Archived`。
+
+[Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) L258-L264：
+```php
+case 'Archived':
+    $assets->join('status_labels AS status_alias', function ($join) {
+        $join->on('status_alias.id', '=', 'assets.status_id')
+            ->where('status_alias.deployable', '=', 0)
+            ->where('status_alias.pending', '=', 0)
+            ->where('status_alias.archived', '=', 1);  // 仅归档
+    });
+    break;
+```
+
+**显式归档筛选的行为：**
+- **仅显示归档资产**（`archived = 1`）
+- **不受 `show_archived_in_list` 影响**（switch 已匹配 `case 'Archived'`，不进入 default）
+- **不显示已软删资产**（无 `withTrashed()` 调用）
+- **不显示无折旧配置的资产**（被 L173-L176 过滤）
+- **必须同时满足** `deployable = 0` 和 `pending = 0`，确保是"纯归档"状态
+
+#### 路径三：显示归档开关（show_archived_in_list）
+
+该开关在 [SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) L115 写入：
+```php
+$setting->show_archived_in_list = $request->input('show_archived_in_list', '0');
+```
+
+**生效条件（L287）：**
+```php
+if ((! $request->filled('status_id')) && ($settings->show_archived_in_list != '1'))
+```
+
+两个条件必须同时满足：
+1. **未显式指定 `status_id`**（如果指定了具体状态 ID，不过滤）
+2. **`show_archived_in_list != '1'`**（开关关闭）
+
+**开关的作用范围：**
+- ✅ 影响资产列表（`api.hardware.index`）
+- ✅ 影响默认折旧报告（`api.depreciation-report.index` 无 status_type）
+- ❌ 不影响显式 `status_type=Archived`（switch 匹配后绕过 default）
+- ❌ 不影响显式 `status_type=Deleted`
+- ❌ 不影响其他 status_type 过滤
+
+#### 路径四：已删除资产筛选（?status_type=Deleted）
+
+对应 API 调用 `GET /api/reports/depreciation?status_type=Deleted`。
+
+[Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) L235-L237：
+```php
+case 'Deleted':
+    $assets->onlyTrashed();  // 仅已软删
+    break;
+```
+
+**已删除资产筛选的行为：**
+- **仅显示已软删资产**（`deleted_at IS NOT NULL`）
+- **不 JOIN status_labels**（代码中没有 JOIN），因此**不按 archived 过滤**
+- **不显示无折旧配置的资产**（被 L173-L176 过滤，这层过滤在 switch 之前执行）
+- 归档状态不影响——已软删资产无论是否归档都会显示
+
+#### 四路径对比总表
+
+| 路径 | URL 参数 | 归档资产 | 已软删资产 | 无折旧资产 | 受 show_archived_in_list 影响？ |
+|------|---------|---------|-----------|-----------|--------------------------------|
+| 默认报告 | 无 | ✅/❌ 取决于开关 | ❌ 不显示 | ❌ 不显示 | ✅ 是 |
+| 显式归档 | `?status_type=Archived` | ✅ 仅显示归档 | ❌ 不显示 | ❌ 不显示 | ❌ 否 |
+| 开关打开 | `show_archived_in_list=1` | ✅ 全部显示 | ❌ 不显示 | ❌ 不显示 | ✅ 是（这就是开关本身） |
+| 已删除 | `?status_type=Deleted` | ⚠️ 忽略归档状态 | ✅ 仅显示已删 | ❌ 不显示 | ❌ 否 |
+
+#### 账面价值显示的一致性
+
+无论哪条路径，一旦资产被查询出来，账面价值计算逻辑**完全相同**：
+
+[DepreciationReportTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/DepreciationReportTransformer.php) L66-L72, L103：
+```php
+if (($asset->model) && ($asset->model->depreciation) && ($asset->model->depreciation->months !== 0)) {
+    $depreciated_value      = Helper::formatCurrencyOutput($asset->getDepreciatedValue());
+    $monthly_depreciation   = Helper::formatCurrencyOutput($asset->getMonthlyDepreciation());
+    $diff                   = Helper::formatCurrencyOutput(($asset->purchase_cost - $asset->getDepreciatedValue()));
+}
+```
+
+**各路径的账面价值显示差异仅在于：**
+1. **哪些资产被包含在结果集中**（由查询过滤决定）
+2. **账面价值的汇总（sumFormatter）会因为包含/排除归档/已删除资产而不同**
+3. **计算逻辑本身没有任何差异**
+
+#### 前端表格列配置
+
+[DepreciationReportPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Presenters/DepreciationReportPresenter.php) L142-L149 定义了账面价值列：
+```php
+[
+    'field'           => 'book_value',
+    'searchable'      => true,
+    'sortable'        => false,
+    'visible'         => true,
+    'title'           => trans('admin/hardware/table.book_value'),
+    'footerFormatter' => 'sumFormatter',   // 底部自动汇总
+    'class'           => 'text-right',
+],
+```
+
+注意：`searchable = true` 意味着前端可以搜索账面价值，但**后端排序被禁用**（`sortable = false`），因为它是计算属性而非数据库字段。
+
 ---
 
 ## 六、报废（删除/恢复）处理流程
