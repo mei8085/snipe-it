@@ -737,32 +737,43 @@ GET /api/hardware?status_type=Archived
 
 ---
 
-## 九、关键代码速查表
+## 九、关键代码速查表（统一版）
 
 | 功能 | 文件 | 方法/位置 |
 |------|------|-----------|
 | 状态标签四象限分类 | [Statuslabel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Statuslabel.php) | `getStatuslabelType()` L99 |
 | 资产更新时自动签回 | [AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Assets/AssetsController.php) | L435-L441 |
 | 可签出检查 | [Asset.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Asset.php) | `availableForCheckout()` L468 |
-| API 查询分流 | [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `index()` L227-L300 |
-| 折旧报告专用路径 | [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) | L85-L88, L173-L176 |
+| API 查询分流（switch 分支） | [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) | `index()` L227-L300 |
+| 折旧报告路由名识别 | [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) | L85-L88 |
+| 折旧报告第1层过滤（depreciation_id IS NOT NULL） | [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) | L173-L176 |
+| 折旧报告第2层过滤（months !== 0 + EOL fallback） | [DepreciationReportTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/DepreciationReportTransformer.php) | L66-L72 |
+| 折旧报告 CSV 导出（独立查询，无 status_type/折旧过滤） | [ReportsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/ReportsController.php) | `exportDeprecationReport()` L174-L245 |
+| CSV 导出账面价值计算（直接调用 getDepreciatedValue） | [ReportsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/ReportsController.php) | L229-L230 |
+| 默认报告归档过滤（show_archived_in_list 生效条件） | [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) | L287-L299 |
+| 显式归档筛选（case 'Archived'） | [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) | L258-L264 |
+| 已删除筛选（case 'Deleted'，不 JOIN status_labels） | [Api/AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Api/AssetsController.php) | L235-L237 |
 | 折旧规则模型 | [Depreciation.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciation.php) | 全文 |
-| 折旧计算核心 | [Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) | `getDepreciatedValue()` L41 |
+| 折旧计算核心（无状态判断） | [Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) | `getDepreciatedValue()` L41-L66 |
+| 无折旧规则时回退为 purchase_cost | [Depreciable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Depreciable.php) | L43-L48 |
 | 报废（软删） | [AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Assets/AssetsController.php) | `destroy()` L536 |
 | 恢复资产 | [AssetsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/Assets/AssetsController.php) | `getRestore()` L942 |
 | 软删模型事件 | [Asset.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Models/Asset.php) | `booted()` L235-L244 |
 | 资产列表账面价值输出 | [AssetsTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/AssetsTransformer.php) | L127 |
-| 折旧报告账面价值输出 | [DepreciationReportTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/DepreciationReportTransformer.php) | `transformAsset()` L33 |
-| 表格列配置 | [AssetPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Presenters/AssetPresenter.php) | book_value L181 |
-| 归档显示开关 | [SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) | L115 |
+| 折旧报告账面价值输出 | [DepreciationReportTransformer.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Transformers/DepreciationReportTransformer.php) | `transformAsset()` L33, L66-L72, L103 |
+| 折旧报告表格列配置 | [DepreciationReportPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Presenters/DepreciationReportPresenter.php) | book_value L142-L149 |
+| 资产列表表格列配置 | [AssetPresenter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Presenters/AssetPresenter.php) | book_value L181 |
+| 归档显示开关写入（默认 '0'） | [SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) | L115 |
 | 折旧方法全局设置 | [SettingsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/app/Http/Controllers/SettingsController.php) | L129 |
+| 折旧报告路由定义 | [api.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/routes/api.php) | L359-L364 |
+| 折旧报告前端入口 | [depreciation.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/27-snipe-it/resources/views/reports/depreciation.blade.php) | L28 |
 
 ---
 
-## 十、核心设计洞察
+## 十、核心设计洞察（统一结论）
 
 ### 1. 计算与查询的关注点分离
-账面价值计算（Depreciable Trait）与资产状态（Statuslabel + SoftDeletes）完全解耦。计算层只关心时间和折旧规则，查询层负责根据状态过滤。这种设计使得：
+账面价值计算（Depreciable Trait）与资产状态（Statuslabel + SoftDeletes）完全解耦。计算层只关心时间和折旧规则（无 deleted_at/status_id/archived 判断），查询层负责根据状态过滤。这种设计使得：
 - 折旧算法可以独立演进
 - 新状态类型的添加不影响折旧逻辑
 - 已删除/归档资产的历史账面价值可追溯
@@ -771,23 +782,42 @@ GET /api/hardware?status_type=Archived
 - `deleted_at` 处理"数据存在性"：资产是否还在系统中"活着"
 - `status_id` + `archived` 处理"业务可用性"：资产是否还在正常使用
 
-两者结合提供了比单一状态字段更丰富的生命周期表达能力。
+两者结合提供了比单一状态字段更丰富的生命周期表达能力。但两者**互不干扰**——`case 'Deleted'` 路径甚至不 JOIN status_labels，完全忽略 archived 状态。
 
-### 3. 折旧报告的数据隔离
-折旧报告通过路由名识别上下文，自动切换 Transformer 并过滤无折旧配置的资产，保证了报告数据的相关性，同时复用了同一套查询基础设施。
+### 3. 折旧报告的三层过滤设计（API 路径）
+折旧报告 API 路径的账面价值显示经过三层控制，每层的职责明确：
+1. **查询层第1层**（L173-L176）：过滤 `depreciation_id IS NULL` 的资产型号，确保只有关联了折旧规则的资产才进入结果集
+2. **查询层第2层**（switch 分支）：根据 `status_type` 决定归档/已删除资产的可见性
+3. **Transformer 层**（L66-L72）：检查 `months !== 0`，若不满足则不计算账面价值（但有 EOL 时回退计算 monthly_depreciation）
 
-### 4. 四路径筛选的设计权衡
-折旧报告的四路径筛选（默认/显式归档/开关/已删除）体现了清晰的权责分离：
-- **默认路径**：面向日常运营，排除归档和已删除，聚焦在用资产
-- **显式归档路径**：面向档案管理，专门查看已退出使用的资产
-- **开关控制**：面向系统配置，灵活适配不同组织的归档策略
-- **已删除路径**：面向审计和资产处置，追踪已报废资产的剩余价值
+### 4. CSV 导出与 API 路径的有意分离
+CSV 导出采用独立查询路径，完全绕过 API 路径的三层过滤设计：
+- 不过滤无折旧配置的资产
+- 不按 archived 过滤
+- 不接受 status_type 参数
+- 无折旧配置时账面价值显示为 purchase_cost
 
-这种设计避免了单一视图无法满足多角色需求的问题，同时保持了代码的复用性——所有路径共享同一个 `index()` 方法和同一套折旧计算逻辑。
+这种设计使得 CSV 导出可以作为"全量数据快照"，而 API 路径专注于"折旧相关数据视图"，两者服务于不同的使用场景。
 
-### 5. 汇总值差异的设计意图
-账面价值汇总值在不同路径下的显著差异（最大可达 69%）并非设计缺陷，而是有意为之：
-- 运营视角：只关心在用资产的账面价值
-- 财务视角：需要包含归档资产的完整账面价值
-- 审计视角：需要单独追踪已报废资产的账面价值
+### 5. 四路径筛选的设计权衡
+折旧报告的四路径筛选（默认/显式归档/已删除/CSV 导出）体现了清晰的权责分离：
+- **默认路径**：面向日常运营，按 show_archived_in_list 开关决定是否显示归档，排除已删除
+- **显式归档路径**：面向档案管理，专门查看已退出使用的资产（archived=1, deployable=0, pending=0）
+- **已删除路径**：面向审计和资产处置，追踪已报废资产的剩余价值（完全忽略 archived 状态）
+- **CSV 导出**：面向财务全量快照，包含所有非删除资产的完整数据
+
+所有路径共享同一个 `getDepreciatedValue()` 计算逻辑，确保账面价值计算口径的一致性。
+
+### 6. 汇总值差异的设计意图
+账面价值汇总值在不同路径下存在差异并非设计缺陷，而是有意为之。差异来源于查询层对以下四类资产的包含/排除：
+1. 已软删资产（deleted_at IS NOT NULL）
+2. 归档资产（status_labels.archived = 1）
+3. 无折旧配置资产（AssetModel.depreciation_id IS NULL）
+4. 折旧月数为0的资产（depreciation.months = 0）
+
+不同路径包含不同的资产集合，因此汇总值不同：
+- 运营视角（默认路径）：只包含在用、有折旧配置且 archvied=0 的资产
+- 财务视角（CSV 导出）：包含全部非删除资产（含归档、含无折旧配置）
+- 档案视角（显式归档）：只包含 archived=1 且有折旧配置的资产
+- 审计视角（已删除路径）：只包含 deleted_at IS NOT NULL 且有折旧配置的资产
 - 不同汇总值服务于不同决策场景，通过路径切换实现数据的多维度呈现
