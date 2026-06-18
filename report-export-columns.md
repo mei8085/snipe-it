@@ -246,9 +246,80 @@ export_options['mso'] = {
 
 这是后端导出中唯一支持列选择的功能，也是本分析的重点。
 
-#### 2.2.1 前端列选择 UI
+#### 2.2.1 前端列选择 UI 与列配置数量核准
 
 位于 [custom.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L92-L345)。
+
+**列配置数量精确定义**：
+
+前端页面共有 **49 个 checkbox**，按功能可分为 6 类：
+
+| 类别 | 数量 | 字段名示例 | 后端是否读取 |
+|------|------|-----------|-------------|
+| 全选交互按钮 | 1 | `checkAll` (无 name) | ❌ 纯前端 JS |
+| 资产基础字段 | 30 | `id`, `asset_tag`, `model`, `purchase_date` 等 | ✅ 全部读取 |
+| 用户相关字段 | 15 | `assigned_to`, `username`, `email`, `department` 等 | ✅ 全部读取 |
+| 自定义字段 | 动态 N | `_snipeit_*` | ✅ 动态读取 |
+| 模板共享选项 | 1 | `is_shared` | ⚠️ 表头读取，数据行未实现 |
+| 筛选控制选项 | 1 | `exclude_archived` | ✅ 用于查询，不导出 |
+| CSV 编码选项 | 1 | `use_bom` | ❌ **完全不读取** |
+
+**46 个后端读取字段（30+15+1）完整清单与导出映射**：
+
+| 序号 | 前端 checkbox (name) | 后端表头代码位置 | 数据行代码位置 | 导出门列数 |
+|------|---------------------|-------------|---------------|-----------|
+| **1** | `is_shared` | [L521-L523](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L521-L523) | **未实现** [L730-L733](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L730-L733) | 1 |
+| **2** | `id` | [L525-L527](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L525-L527) | [L877-L879](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L877-L879) | 1 |
+| **3** | `company` | [L529-L531](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L529-L531) | [L881-L883](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L881-L883) | 1 |
+| **4** | `asset_name` | [L533-L535](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L533-L535) | [L885-L887](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L885-L887) | 1 |
+| **5** | `asset_tag` | [L537-L539](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L537-L539) | [L889-L891](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L889-L891) | 1 |
+| **6** | `model` | [L541-L544](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L541-L544) | [L893-L896](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L893-L896) | **2** |
+| **7** | `category` | [L546-L548](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L546-L548) | [L898-L900](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L898-L900) | 1 |
+| **8** | `manufacturer` | [L550-L552](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L550-L552) | [L902-L904](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L902-L904) | 1 |
+| **9** | `serial` | [L554-L556](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L554-L556) | [L906-L908](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L906-L908) | 1 |
+| **10** | `purchase_date` | [L557-L559](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L557-L559) | [L910-L912](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L910-L912) | 1 |
+| **11** | `purchase_cost` | [L561-L563](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L561-L563) | [L914-L916](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L914-L916) | 1 |
+| **12** | `eol` | [L565-L567](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L565-L567) | [L918-L920](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L918-L920) | 1 |
+| **13** | `warranty` | [L569-L572](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L569-L572) | [L922-L925](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L922-L925) | **2** |
+| **14** | `depreciation` | [L574-L578](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L574-L578) | [L927-L933](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L927-L933) | **3** |
+| **15** | `order` | [L580-L582](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L580-L582) | [L935-L937](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L935-L937) | 1 |
+| **16** | `supplier` | [L584-L586](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L584-L586) | [L939-L941](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L939-L941) | 1 |
+| **17** | `location` | [L588-L590](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L588-L590) | [L943-L945](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L943-L945) | 1 |
+| **18** | `location_address` | [L591-L598](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L591-L598) | [L947-L954](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L947-L954) | **6** |
+| **19** | `rtd_location` | [L600-L602](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L600-L602) | [L956-L958](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L956-L958) | 1 |
+| **20** | `rtd_location_address` | [L604-L611](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L604-L611) | [L960-L967](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L960-L967) | **6** |
+| **21** | `assigned_to` | [L613-L616](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L613-L616) | [L969-L972](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L969-L972) | **2** |
+| **22** | `username` | [L618-L620](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L618-L620) | [L974-L981](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L974-L981) | 1 |
+| **23** | `user_company` | [L622-L624](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L622-L624) | [L983-L989](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L983-L989) | 1 |
+| **24** | `email` | [L626-L628](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L626-L628) | [L991-L998](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L991-L998) | 1 |
+| **25** | `employee_num` | [L630-L632](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L630-L632) | [L1000-L1007](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1000-L1007) | 1 |
+| **26** | `manager` | [L634-L636](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L634-L636) | [L1009-L1015](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1009-L1015) | 1 |
+| **27** | `department` | [L638-L640](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L638-L640) | [L1017-L1023](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1017-L1023) | 1 |
+| **28** | `title` | [L642-L644](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L642-L644) | [L1025-L1031](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1025-L1031) | 1 |
+| **29** | `phone` | [L646-L648](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L646-L648) | [L1033-L1039](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1033-L1039) | 1 |
+| **30** | `user_address` | [L650-L652](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L650-L652) | [L1041-L1047](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1041-L1047) | 1 |
+| **31** | `user_city` | [L654-L656](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L654-L656) | [L1049-L1055](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1049-L1055) | 1 |
+| **32** | `user_state` | [L658-L660](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L658-L660) | [L1057-L1063](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1057-L1063) | 1 |
+| **33** | `user_country` | [L662-L664](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L662-L664) | [L1065-L1071](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1065-L1071) | 1 |
+| **34** | `user_zip` | [L666-L668](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L666-L668) | [L1073-L1079](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1073-L1079) | 1 |
+| **35** | `target_notes` | [L670-L672](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L670-L672) | [L1081-L1087](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1081-L1087) | 1 |
+| **36** | `status` | [L674-L676](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L674-L676) | [L1089-L1091](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1089-L1091) | 1 |
+| **37** | `checkout_date` | [L678-L680](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L678-L680) | [L1093-L1095](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1093-L1095) | 1 |
+| **38** | `checkin_date` | [L682-L684](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L682-L684) | [L1097-L1101](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1097-L1101) | 1 |
+| **39** | `expected_checkin` | [L686-L688](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L686-L688) | [L1103-L1105](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1103-L1105) | 1 |
+| **40** | `created_at` | [L690-L692](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L690-L692) | [L1107-L1109](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1107-L1109) | 1 |
+| **41** | `updated_at` | [L694-L696](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L694-L696) | [L1111-L1113](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1111-L1113) | 1 |
+| **42** | `deleted_at` | [L698-L700](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L698-L700) | [L1115-L1117](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1115-L1117) | 1 |
+| **43** | `last_audit_date` | [L702-L704](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L702-L704) | [L1119-L1121](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1119-L1121) | 1 |
+| **44** | `next_audit_date` | [L706-L708](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L706-L708) | [L1123-L1125](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1123-L1125) | 1 |
+| **45** | `notes` | [L710-L712](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L710-L712) | [L1127-L1129](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1127-L1129) | 1 |
+| **46** | `url` | [L714-L716](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L714-L716) | [L1131-L1133](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1131-L1133) | 1 |
+| **47** | 自定义字段 | [L718-L722](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L718-L722) | [L1135-L1146](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L1135-L1146) | N |
+
+> ⚠️ **列配置数量澄清**：
+> - 前端 checkbox 总数：49 个（含交互、筛选、编码选项）
+> - 后端实际读取的字段：46 个（is_shared + 45 个数据列）+ 自定义字段
+> - 全部勾选时的最大导出列数：约 **75+ 列**（因为存在一对多映射：model→2, warranty→2, depreciation→3, location_address→6, rtd_location_address→6, assigned_to→2）
 
 **列选择区域结构**：
 
@@ -272,7 +343,7 @@ export_options['mso'] = {
         {{ trans('general.asset_tag') }}
     </label>
 
-    <!-- ... 约 50+ 个基础字段 ... -->
+    <!-- ... 共 30 个基础字段 ... -->
 
     <!-- 用户相关字段组 -->
     <h2>{{ trans('general.checked_out_to_fields') }}:</h2>
@@ -280,7 +351,7 @@ export_options['mso'] = {
         <input type="checkbox" name="assigned_to" value="1" @checked(...) />
         {{ trans('admin/licenses/table.assigned_to') }}
     </label>
-    <!-- username, email, manager, department 等 -->
+    <!-- username, email, manager, department 等 15 个用户字段 -->
 
     <!-- 自定义字段动态生成 -->
     @if ($customfields->count() > 0)
@@ -499,6 +570,109 @@ if (config('app.escape_formulas') === false) {
 fprintf($handle, chr(0xEF).chr(0xBB).chr(0xBF));  // UTF-8 BOM，解决 Excel 中文乱码
 ```
 
+
+### 2.5 共享模板(is_shared) 与地址类字段映射核准
+
+#### 2.5.1 共享模板勾选(is_shared) 映射分析
+
+**问题描述**：`is_shared` 列存在表头数据不一致的严重 Bug。
+
+| 环节 | 处理逻辑 | 代码位置 |
+|------|---------|---------|
+| 前端 UI | 独立 checkbox（不在 included_fields_wrapper 内） | [custom.blade.php:80](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L80) |
+| 表头生成 | 添加 "Share template" 列 | [L521-L523](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L521-L523) |
+| 数据行生成 | 未实现（只有 TODO 注释） | [L730-L733](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L730-L733) |
+
+**代码证据**：
+
+表头（L521-L523）：
+```php
+if ($request->filled('is_shared')) {
+    $header[] = trans('admin/reports/general.share_template');
+}
+```
+
+数据行（L730-L733）：
+```php
+if ($request->filled('is_shared')) {
+    // to fill with logic for the report template and NOT the assets retrieved by the query
+    // do we scope here or??
+}
+```
+
+**后果**：当 `is_shared` 被勾选时，所有列向右偏移 1 列：
+- 表头第 1 列："Share template"
+- 数据第 1 列：资产 ID（本应是 is_shared 的值）
+- 表头第 2 列："ID"
+- 数据第 2 列：公司名称（本应是 ID）
+- 依此类推，全部错位
+
+#### 2.5.2 地址类字段映射分析
+
+地址类字段包括 4 个 checkbox，对应不同的映射关系：
+
+| 前端 checkbox | 导出门列数 | 表头文本 | 对应数据字段 |
+|--------------|-----------|---------|-------------|
+| `location` | 1 | "Location" | `$asset->location->display_name` |
+| `location_address` | 6 | "Address", "Address", "City", "State", "Country", "Zip" | `address`, `address2`, `city`, `state`, `country`, `zip` |
+| `rtd_location` | 1 | "Default Location" | `$asset->defaultLoc->display_name` |
+| `rtd_location_address` | 6 | "Address", "Address", "City", "State", "Country", "Zip" | 同上 |
+
+**`location_address` 映射详情**：
+
+表头代码 [L591-L598](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L591-L598)：
+```php
+if ($request->filled('location_address')) {
+    $header[] = trans('general.address');   // 列 1: Address
+    $header[] = trans('general.address');   // 列 2: Address - 重复
+    $header[] = trans('general.city');      // 列 3: City
+    $header[] = trans('general.state');     // 列 4: State
+    $header[] = trans('general.country');   // 列 5: Country
+    $header[] = trans('general.zip');       // 列 6: Zip
+}
+```
+
+数据行代码 [L947-L954](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L947-L954)：
+```php
+if ($request->filled('location_address')) {
+    $row[] = ($asset->location) ? $asset->location->address : '';   // 对应列 1
+    $row[] = ($asset->location) ? $asset->location->address2 : '';  // 对应列 2
+    $row[] = ($asset->location) ? $asset->location->city : '';      // 对应列 3
+    $row[] = ($asset->location) ? $asset->location->state : '';     // 对应列 4
+    $row[] = ($asset->location) ? $asset->location->country : '';   // 对应列 5
+    $row[] = ($asset->location) ? $asset->location->zip : '';       // 对应列 6
+}
+```
+
+**问题**：前两列表头都是 "Address"，用户无法区分哪列是 `address`（地址行 1），哪列是 `address2`（地址行 2）。
+
+`rtd_location_address` 存在完全相同的问题 [L604-L611](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L604-L611)。
+
+#### 2.5.3 所有一对多列映射完整清单
+
+| 前端 checkbox | 导出门列数 | 导出列明细 |
+|--------------|-----------|-----------|
+| `model` | 2 | 型号名称、型号编号 |
+| `warranty` | 2 | 保修月数、保修到期日 |
+| `depreciation` | 3 | 账面价值、差额、完全折旧日期 |
+| `location_address` | 6 | Address, Address, City, State, Country, Zip |
+| `rtd_location_address` | 6 | Address, Address, City, State, Country, Zip |
+| `assigned_to` | 2 | 借用人名称、借用人类型 |
+
+**全部勾选时的列数计算**：
+- 49 个前端 checkbox / 46 个后端读取字段（含 is_shared）
+- + 1（model 多 1 列）
+- + 1（warranty 多 1 列）
+- + 2（depreciation 多 2 列）
+- + 5（location_address 多 5 列）
+- + 5（rtd_location_address 多 5 列）
+- + 1（assigned_to 多 1 列）
+- + N（自定义字段）
+- 总计：约 62 + N 列
+
+---
+
+
 ---
 
 ## 三、两种导出体系对比总结
@@ -517,9 +691,38 @@ fprintf($handle, chr(0xEF).chr(0xBB).chr(0xBF));  // UTF-8 BOM，解决 Excel �
 | **筛选条件** | 前端搜索 + 后端 API 过滤 | 丰富的后端筛选条件 |
 | **当前状态** | 推荐方式（v2 默认） | 仅自定义报表活跃，其余已废弃 |
 
+
+
 ---
 
-## 四、关键文件索引
+## 四、已知代码缺陷
+
+按严重程度排序：
+
+### 4.1 is_shared 列错位（严重）
+
+- **问题**：表头有 is_shared 列但数据行未实现，导致勾选时所有列向右偏移 1 列
+- **代码位置**：[L521-L523](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L521-L523)（表头）, [L730-L733](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L730-L733)（数据行）
+- **影响**：勾选 is_shared 时，所有导出数据列错位 1 列
+
+### 4.2 location_address 表头重复
+
+- **问题**：两个 "Address" 列标题相同，无法区分 address（地址行1）和 address2（地址行2）
+- **代码位置**：[L591-L598](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L591-L598)
+- **影响**：导出 CSV 中两列标题相同，用户无法区分
+
+### 4.3 rtd_location_address 表头重复
+
+- **问题**：同上
+- **代码位置**：[L604-L611](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L604-L611)
+
+### 4.4 use_bom 复选框无效
+
+- **问题**：UI 存在 use_bom 复选框，但后端完全不读取该参数，BOM 始终硬编码输出
+- **代码位置**：[custom.blade.php:627](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/custom.blade.php#L627)（UI）, [L517](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/app/Http/Controllers/ReportsController.php#L517)（硬编码）
+- **影响**：用户勾选无效，功能名存实亡
+
+## 五、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
@@ -536,3 +739,4 @@ fprintf($handle, chr(0xEF).chr(0xBB).chr(0xBF));  // UTF-8 BOM，解决 Excel �
 | [resources/views/reports/asset.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/resources/views/reports/asset.blade.php) | 资产报表视图（传统 th 列配置示例） |
 | [routes/web.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/routes/web.php#L465-L587) | 报表相关路由定义 |
 | [routes/web/users.php](file:///d:/fz/0601-2/solo-dogfeeding/code/26-snipe-it/routes/web/users.php#L29-L35) | 用户导出路由 |
+
